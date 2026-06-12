@@ -1,0 +1,980 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>PDF 병합</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #09090b;
+        --surface: #121216;
+        --surface-elevated: #1a1a20;
+        --surface-soft: #23232c;
+        --ink: #f2f2f7;
+        --muted: #a1a1b5;
+        --line: #2a2a35;
+        --line-strong: #424254;
+        --accent: #b49ce5;
+        --accent-strong: #c8b4f4;
+        --accent-ink: #18102a;
+        --danger: #ff7a85;
+        --warning: #f4c062;
+        --shadow: 0 22px 70px rgba(0, 0, 0, 0.45);
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      [hidden] {
+        display: none !important;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100svh;
+        background:
+          radial-gradient(circle at 15% 0%, rgba(180, 156, 229, 0.16), transparent 28rem),
+          linear-gradient(180deg, #09090b, #101014 48%, #09090b),
+          var(--bg);
+        color: var(--ink);
+        font-family:
+          Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
+          sans-serif;
+        letter-spacing: 0;
+      }
+
+      button,
+      input {
+        font: inherit;
+      }
+
+      button {
+        border: 0;
+      }
+
+      .app {
+        width: min(1180px, calc(100% - 32px));
+        margin: 0 auto;
+        padding: 40px 0;
+      }
+
+      .summary {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(112px, 1fr));
+        min-width: 230px;
+        overflow: hidden;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: var(--surface);
+      }
+
+      .metric {
+        padding: 18px 20px;
+      }
+
+      .metric + .metric {
+        border-left: 1px solid var(--line);
+      }
+
+      .metric span {
+        display: block;
+        color: var(--muted);
+        font-size: 0.78rem;
+      }
+
+      .metric strong {
+        display: block;
+        margin-top: 4px;
+        font-size: 2rem;
+        line-height: 1;
+      }
+
+      .workspace {
+        display: flex;
+        flex-direction: column;
+        gap: 32px;
+        align-items: stretch;
+      }
+
+      .panel {
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: rgba(18, 18, 22, 0.92);
+        box-shadow: var(--shadow);
+      }
+
+      .drop-zone {
+        position: relative;
+        display: grid;
+        gap: 24px;
+        min-height: 320px;
+        flex-grow: 1;
+        padding: 40px;
+        align-content: center;
+        justify-items: center;
+        text-align: center;
+        border: 2px dashed var(--line-strong);
+        border-radius: 12px;
+        background:
+          linear-gradient(135deg, rgba(180, 156, 229, 0.14), rgba(255, 255, 255, 0.03)),
+          var(--surface);
+        transition:
+          border-color 160ms ease,
+          background 160ms ease,
+          transform 160ms ease;
+        cursor: pointer;
+      }
+
+      .drop-zone.is-over {
+        border-color: var(--accent);
+        background:
+          linear-gradient(135deg, rgba(180, 156, 229, 0.22), rgba(255, 255, 255, 0.06)),
+          var(--surface);
+        transform: translateY(-2px);
+      }
+
+      .drop-copy {
+        display: grid;
+        gap: 12px;
+      }
+
+      .drop-copy strong {
+        font-size: 1.6rem;
+      }
+
+      .drop-copy span {
+        color: var(--muted);
+        font-size: 1.1rem;
+        line-height: 1.5;
+      }
+
+      .file-input {
+        position: absolute;
+        inline-size: 1px;
+        block-size: 1px;
+        overflow: hidden;
+        clip: rect(0 0 0 0);
+        white-space: nowrap;
+      }
+
+      .primary-button,
+      .secondary-button,
+      .icon-button,
+      .download-link {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        gap: 8px;
+        min-height: 42px;
+        border-radius: 7px;
+        cursor: pointer;
+        text-decoration: none;
+        transition:
+          transform 140ms ease,
+          background 140ms ease,
+          color 140ms ease,
+          border-color 140ms ease,
+          opacity 140ms ease;
+      }
+
+      .primary-button,
+      .download-link {
+        padding: 0 18px;
+        background: var(--accent);
+        color: var(--accent-ink);
+        font-weight: 700;
+      }
+
+      .primary-button:hover:not(:disabled),
+      .download-link:hover {
+        background: var(--accent-strong);
+        transform: translateY(-1px);
+      }
+
+      .secondary-button {
+        padding: 0 16px;
+        border: 1px solid var(--line);
+        background: var(--surface-elevated);
+        color: var(--ink);
+      }
+
+      .secondary-button:hover:not(:disabled) {
+        border-color: var(--line-strong);
+        transform: translateY(-1px);
+      }
+
+      .icon-button {
+        inline-size: 38px;
+        min-width: 38px;
+        padding: 0;
+        border: 1px solid transparent;
+        background: transparent;
+        color: var(--muted);
+      }
+
+      .icon-button:hover:not(:disabled) {
+        border-color: var(--line);
+        background: var(--surface-soft);
+        color: var(--ink);
+      }
+
+      button:disabled {
+        cursor: not-allowed;
+        opacity: 0.42;
+      }
+
+      #mergeButton {
+        width: 100%;
+        font-size: 1.3rem;
+        padding: 0 32px;
+        min-height: 64px;
+        border-radius: 12px;
+      }
+
+      #mergeButton svg {
+        inline-size: 24px;
+        block-size: 24px;
+      }
+
+      .queue {
+        position: relative;
+        display: flex;
+        flex-direction: column;
+        min-height: 640px;
+        padding: 22px;
+        transition: border-color 160ms ease, box-shadow 160ms ease;
+      }
+
+      .queue::after {
+        content: "+";
+        position: absolute;
+        inset: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 10rem;
+        font-weight: 300;
+        color: rgba(180, 156, 229, 0.4);
+        background: rgba(9, 9, 11, 0.6);
+        backdrop-filter: blur(8px);
+        -webkit-backdrop-filter: blur(8px);
+        border-radius: inherit;
+        opacity: 0;
+        pointer-events: none;
+        transition: opacity 200ms ease;
+        z-index: 50;
+      }
+
+      .queue.is-over {
+        border-color: var(--accent);
+        box-shadow: 0 0 0 2px var(--accent);
+      }
+
+      .queue.is-over::after {
+        opacity: 1;
+      }
+
+      .queue-toolbar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 16px;
+      }
+
+      .queue-toolbar {
+        padding-bottom: 18px;
+        border-bottom: 1px solid var(--line);
+      }
+
+      .queue-controls {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+        justify-content: flex-end;
+      }
+
+      .sort-control {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        color: var(--muted);
+        font-size: 0.9rem;
+      }
+
+      .sort-control select {
+        min-height: 42px;
+        max-width: 220px;
+        padding: 0 34px 0 12px;
+        border: 1px solid var(--line);
+        border-radius: 7px;
+        background: var(--surface-elevated);
+        color: var(--ink);
+        cursor: pointer;
+      }
+
+      .sort-control select:disabled {
+        cursor: not-allowed;
+        opacity: 0.42;
+      }
+
+      .actions {
+        margin-top: 24px;
+        display: flex;
+        flex-direction: column;
+        align-items: stretch;
+        gap: 16px;
+      }
+
+      .actions-left,
+      .actions-right {
+        display: flex;
+        flex-direction: column;
+        align-items: stretch;
+        gap: 12px;
+      }
+
+      .status {
+        min-height: 24px;
+        margin: auto 0 0;
+        padding-top: 16px;
+        color: var(--muted);
+        font-size: 0.92rem;
+        line-height: 1.45;
+      }
+
+      .status.is-error {
+        color: var(--danger);
+      }
+
+      .status.is-warning {
+        color: var(--warning);
+      }
+
+      .file-list {
+        display: grid;
+        align-content: start;
+        gap: 10px;
+        min-height: 220px;
+        margin: 18px 0 0;
+        padding: 0;
+        list-style: none;
+      }
+
+      .empty {
+        display: grid;
+        min-height: 220px;
+        place-items: center;
+        border: 1px dashed var(--line);
+        border-radius: 8px;
+        color: var(--muted);
+        text-align: center;
+      }
+
+      .file-row {
+        display: grid;
+        grid-template-columns: 34px minmax(0, 1fr) auto;
+        gap: 12px;
+        align-items: center;
+        min-height: 72px;
+        padding: 12px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: var(--surface);
+        transition:
+          border-color 140ms ease,
+          box-shadow 140ms ease,
+          transform 140ms ease,
+          opacity 140ms ease;
+      }
+
+      .file-row:hover {
+        border-color: var(--line-strong);
+        box-shadow: 0 12px 32px rgba(0, 0, 0, 0.22);
+      }
+
+      .file-row.is-dragging {
+        opacity: 0.48;
+      }
+
+      .file-row.is-drop-target {
+        border-color: var(--accent);
+        transform: translateY(-1px);
+      }
+
+      .drag-handle {
+        display: grid;
+        inline-size: 34px;
+        block-size: 42px;
+        place-items: center;
+        color: var(--muted);
+        cursor: grab;
+      }
+
+      .file-main {
+        min-width: 0;
+      }
+
+      .file-name {
+        overflow: hidden;
+        font-weight: 700;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .file-meta {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        margin-top: 5px;
+        color: var(--muted);
+        font-size: 0.84rem;
+      }
+
+      .file-error {
+        color: var(--danger);
+      }
+
+      .row-controls {
+        display: flex;
+        gap: 4px;
+      }
+
+      svg {
+        inline-size: 18px;
+        block-size: 18px;
+        stroke: currentColor;
+        stroke-width: 2;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+        fill: none;
+      }
+
+      @media (max-width: 860px) {
+        .app {
+          width: min(100% - 24px, 720px);
+          padding: 22px 0;
+        }
+
+        .summary {
+          min-width: 0;
+        }
+
+        .drop-zone {
+          min-height: 280px;
+        }
+      }
+
+      @media (max-width: 560px) {
+        .app {
+          width: calc(100% - 18px);
+        }
+
+        .queue,
+        .drop-zone {
+          padding: 18px;
+        }
+
+        .queue-toolbar,
+        .actions {
+          align-items: stretch;
+          flex-direction: column;
+        }
+
+        .queue-controls,
+        .actions-left,
+        .actions-right,
+        .primary-button,
+        .secondary-button,
+        .download-link,
+        .sort-control select {
+          width: 100%;
+        }
+
+        .sort-control {
+          align-items: stretch;
+          flex-direction: column;
+          gap: 6px;
+        }
+
+        .file-row {
+          grid-template-columns: 28px minmax(0, 1fr);
+        }
+
+        .row-controls {
+          grid-column: 1 / -1;
+          justify-content: flex-end;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main class="app">
+      <section class="workspace">
+        <section class="queue panel" id="queuePanel" aria-label="병합 예정 파일">
+          <input class="file-input" id="fileInput" type="file" accept="application/pdf,.pdf" multiple>
+          <div class="queue-toolbar">
+            <div class="summary" aria-label="선택 상태">
+              <div class="metric">
+                <span>파일</span>
+                <strong id="fileCount">0</strong>
+              </div>
+              <div class="metric">
+                <span>페이지</span>
+                <strong id="pageCount">0</strong>
+              </div>
+            </div>
+            <div class="queue-controls">
+              <label class="secondary-button" for="fileInput" style="cursor: pointer;">
+                <svg viewBox="0 0 24 24" aria-hidden="true" style="width: 18px; height: 18px; margin-right: 4px;">
+                  <path d="M12 5v14"></path>
+                  <path d="M5 12h14"></path>
+                </svg>
+                파일 추가
+              </label>
+              <label class="sort-control" for="sortSelect">
+                <span>정렬</span>
+                <select id="sortSelect" disabled>
+                  <option value="manual">사용자 지정</option>
+                  <option value="nameAsc">파일명 오름차순</option>
+                  <option value="nameDesc">파일명 내림차순</option>
+                  <option value="sizeAsc">크기 작은순</option>
+                  <option value="sizeDesc">크기 큰순</option>
+                  <option value="pagesAsc">페이지 적은순</option>
+                  <option value="pagesDesc">페이지 많은순</option>
+                  <option value="addedAsc">추가순</option>
+                </select>
+              </label>
+              <button class="secondary-button" id="clearButton" type="button" disabled>비우기</button>
+            </div>
+          </div>
+
+          <ol class="file-list" id="fileList"></ol>
+          <label class="drop-zone" id="emptyState" for="fileInput">
+            <span class="drop-copy">
+              <strong>PDF 파일 선택</strong>
+              <span>클릭하거나 이 영역으로 파일을 끌어오세요.</span>
+            </span>
+            <span class="primary-button" aria-hidden="true">
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M12 5v14"></path>
+                <path d="M5 12h14"></path>
+              </svg>
+              파일 추가
+            </span>
+          </label>
+
+          <p class="status" id="status" role="status" aria-live="polite"></p>
+
+          <div class="actions">
+            <div class="actions-left">
+              <button class="primary-button" id="mergeButton" type="button" disabled>
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M8 7h8"></path>
+                  <path d="M8 12h8"></path>
+                  <path d="M8 17h8"></path>
+                  <path d="M5 7h.01"></path>
+                  <path d="M5 12h.01"></path>
+                  <path d="M5 17h.01"></path>
+                </svg>
+                PDF 병합
+              </button>
+            </div>
+            <div class="actions-right" id="downloadSlot"></div>
+          </div>
+        </section>
+      </section>
+    </main>
+
+    <template id="fileRowTemplate">
+      <li class="file-row" draggable="true">
+        <span class="drag-handle" title="끌어서 순서 변경" aria-hidden="true">
+          <svg viewBox="0 0 24 24">
+            <path d="M9 5h.01"></path>
+            <path d="M15 5h.01"></path>
+            <path d="M9 12h.01"></path>
+            <path d="M15 12h.01"></path>
+            <path d="M9 19h.01"></path>
+            <path d="M15 19h.01"></path>
+          </svg>
+        </span>
+        <span class="file-main">
+          <span class="file-name"></span>
+          <span class="file-meta"></span>
+        </span>
+        <span class="row-controls">
+          <button class="icon-button move-up" type="button" title="위로 이동" aria-label="위로 이동">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="m18 15-6-6-6 6"></path>
+            </svg>
+          </button>
+          <button class="icon-button move-down" type="button" title="아래로 이동" aria-label="아래로 이동">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="m6 9 6 6 6-6"></path>
+            </svg>
+          </button>
+          <button class="icon-button remove" type="button" title="삭제" aria-label="삭제">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M3 6h18"></path>
+              <path d="M8 6V4h8v2"></path>
+              <path d="m10 11 .5 6"></path>
+              <path d="m14 11-.5 6"></path>
+              <path d="M6 6l1 15h10l1-15"></path>
+            </svg>
+          </button>
+        </span>
+      </li>
+    </template>
+
+    <script src="src/pdf-merger.js"></script>
+    <script>
+      const fileInput = document.getElementById("fileInput");
+      const dropZone = document.getElementById("queuePanel");
+      const fileList = document.getElementById("fileList");
+      const emptyState = document.getElementById("emptyState");
+      const statusNode = document.getElementById("status");
+      const mergeButton = document.getElementById("mergeButton");
+      const clearButton = document.getElementById("clearButton");
+      const sortSelect = document.getElementById("sortSelect");
+      const downloadSlot = document.getElementById("downloadSlot");
+      const fileCount = document.getElementById("fileCount");
+      const pageCount = document.getElementById("pageCount");
+      const rowTemplate = document.getElementById("fileRowTemplate");
+
+      let files = [];
+      let dragId = "";
+      let downloadUrl = "";
+      let addedOrder = 0;
+
+      function formatBytes(bytes) {
+        if (bytes < 1024) {
+          return `${bytes} B`;
+        }
+        const units = ["KB", "MB", "GB"];
+        let value = bytes / 1024;
+        let unitIndex = 0;
+        while (value >= 1024 && unitIndex < units.length - 1) {
+          value /= 1024;
+          unitIndex += 1;
+        }
+        return `${value.toFixed(value >= 10 ? 1 : 2)} ${units[unitIndex]}`;
+      }
+
+      function setStatus(message, type) {
+        statusNode.textContent = message || "";
+        statusNode.classList.toggle("is-error", type === "error");
+        statusNode.classList.toggle("is-warning", type === "warning");
+      }
+
+      function revokeDownload() {
+        if (downloadUrl) {
+          URL.revokeObjectURL(downloadUrl);
+          downloadUrl = "";
+        }
+        downloadSlot.replaceChildren();
+      }
+
+      function updateSummary() {
+        fileCount.textContent = String(files.length);
+        pageCount.textContent = String(
+          files.reduce((sum, item) => sum + (item.pageCount || 0), 0)
+        );
+      }
+
+      function canMerge() {
+        return files.length > 0 && files.every((item) => item.status === "ready");
+      }
+
+      function compareFiles(sortMode, left, right) {
+        const nameCompare = left.file.name.localeCompare(right.file.name, "ko", {
+          numeric: true,
+          sensitivity: "base"
+        });
+        const fallback = left.addedOrder - right.addedOrder;
+
+        if (sortMode === "nameAsc") {
+          return nameCompare || fallback;
+        }
+        if (sortMode === "nameDesc") {
+          return -nameCompare || fallback;
+        }
+        if (sortMode === "sizeAsc") {
+          return left.file.size - right.file.size || nameCompare || fallback;
+        }
+        if (sortMode === "sizeDesc") {
+          return right.file.size - left.file.size || nameCompare || fallback;
+        }
+        if (sortMode === "pagesAsc") {
+          return left.pageCount - right.pageCount || nameCompare || fallback;
+        }
+        if (sortMode === "pagesDesc") {
+          return right.pageCount - left.pageCount || nameCompare || fallback;
+        }
+        if (sortMode === "addedAsc") {
+          return fallback;
+        }
+        return 0;
+      }
+
+      function applySort(sortMode) {
+        if (sortMode === "manual" || files.length < 2) {
+          return;
+        }
+        revokeDownload();
+        sortFiles(sortMode);
+        setStatus("정렬을 적용했습니다.");
+        render();
+      }
+
+      function sortFiles(sortMode) {
+        files.sort((left, right) => compareFiles(sortMode, left, right));
+      }
+
+      function render() {
+        fileList.replaceChildren();
+        emptyState.hidden = files.length > 0;
+        fileList.hidden = files.length === 0;
+
+        files.forEach((item, index) => {
+          const row = rowTemplate.content.firstElementChild.cloneNode(true);
+          row.dataset.id = item.id;
+          row.classList.toggle("is-dragging", item.id === dragId);
+          row.querySelector(".file-name").textContent = item.file.name;
+
+          const meta = row.querySelector(".file-meta");
+          if (item.status === "error") {
+            meta.innerHTML = "";
+            const error = document.createElement("span");
+            error.className = "file-error";
+            error.textContent = item.error;
+            meta.append(error);
+          } else {
+            const pageLabel =
+              item.status === "ready" ? `${item.pageCount}페이지` : "읽는 중";
+            meta.textContent = `${formatBytes(item.file.size)} · ${pageLabel}`;
+          }
+
+          row.querySelector(".move-up").disabled = index === 0;
+          row.querySelector(".move-down").disabled = index === files.length - 1;
+          row.querySelector(".move-up").addEventListener("click", () => moveItem(index, index - 1));
+          row
+            .querySelector(".move-down")
+            .addEventListener("click", () => moveItem(index, index + 1));
+          row.querySelector(".remove").addEventListener("click", () => removeItem(item.id));
+
+          row.addEventListener("dragstart", (event) => {
+            dragId = item.id;
+            event.dataTransfer.effectAllowed = "move";
+            event.dataTransfer.setData("text/plain", item.id);
+            requestAnimationFrame(render);
+          });
+          row.addEventListener("dragend", () => {
+            dragId = "";
+            render();
+          });
+          row.addEventListener("dragover", (event) => {
+            event.preventDefault();
+            row.classList.add("is-drop-target");
+          });
+          row.addEventListener("dragleave", () => {
+            row.classList.remove("is-drop-target");
+          });
+          row.addEventListener("drop", (event) => {
+            event.preventDefault();
+            row.classList.remove("is-drop-target");
+            reorderById(event.dataTransfer.getData("text/plain"), item.id);
+          });
+
+          fileList.append(row);
+        });
+
+        clearButton.disabled = files.length === 0;
+        sortSelect.disabled = files.length < 2;
+        mergeButton.disabled = !canMerge();
+        updateSummary();
+      }
+
+      function moveItem(fromIndex, toIndex) {
+        if (toIndex < 0 || toIndex >= files.length) {
+          return;
+        }
+        revokeDownload();
+        sortSelect.value = "manual";
+        const [item] = files.splice(fromIndex, 1);
+        files.splice(toIndex, 0, item);
+        setStatus("");
+        render();
+      }
+
+      function reorderById(sourceId, targetId) {
+        if (!sourceId || sourceId === targetId) {
+          return;
+        }
+        const fromIndex = files.findIndex((item) => item.id === sourceId);
+        const toIndex = files.findIndex((item) => item.id === targetId);
+        if (fromIndex === -1 || toIndex === -1) {
+          return;
+        }
+        moveItem(fromIndex, toIndex);
+      }
+
+      function removeItem(id) {
+        revokeDownload();
+        files = files.filter((item) => item.id !== id);
+        setStatus("");
+        render();
+      }
+
+      async function addFiles(fileListObject) {
+        const activeSortMode = sortSelect.value;
+        const selected = Array.from(fileListObject).filter((file) => {
+          return file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf");
+        });
+
+        if (selected.length === 0) {
+          setStatus("PDF 파일만 추가할 수 있습니다.", "warning");
+          return;
+        }
+
+        revokeDownload();
+        const nextItems = selected.map((file) => ({
+          id: crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`,
+          file,
+          addedOrder: addedOrder++,
+          arrayBuffer: null,
+          pageCount: 0,
+          status: "loading",
+          error: ""
+        }));
+        files = files.concat(nextItems);
+        setStatus("파일을 확인하는 중입니다.");
+        render();
+
+        await Promise.all(
+          nextItems.map(async (item) => {
+            try {
+              item.arrayBuffer = await item.file.arrayBuffer();
+              const info = PdfMerger.analyzePdfDocument(
+                new Uint8Array(item.arrayBuffer),
+                item.file.name
+              );
+              item.pageCount = info.pageCount;
+              item.status = "ready";
+            } catch (error) {
+              item.status = "error";
+              item.error = error.message || "이 PDF는 병합할 수 없습니다.";
+            }
+          })
+        );
+
+        const failed = nextItems.filter((item) => item.status === "error").length;
+        const didApplySort = activeSortMode !== "manual" && files.length > 1;
+        if (didApplySort) {
+          sortFiles(activeSortMode);
+        }
+
+        if (failed > 0) {
+          setStatus("일부 PDF를 읽을 수 없습니다. 해당 파일을 삭제한 뒤 다시 병합하세요.", "error");
+        } else if (didApplySort) {
+          setStatus(`${nextItems.length}개 파일을 추가하고 정렬을 적용했습니다.`);
+        } else {
+          setStatus(`${nextItems.length}개 파일을 추가했습니다.`);
+        }
+        render();
+      }
+
+      async function mergeFiles() {
+        if (!canMerge()) {
+          return;
+        }
+
+        try {
+          mergeButton.disabled = true;
+          setStatus("PDF를 병합하는 중입니다.");
+          revokeDownload();
+
+          const result = PdfMerger.mergePdfDocuments(
+            files.map((item) => ({
+              name: item.file.name,
+              data: new Uint8Array(item.arrayBuffer)
+            }))
+          );
+          const blob = new Blob([result.bytes], { type: "application/pdf" });
+
+          if (window.showSaveFilePicker) {
+            try {
+              const handle = await window.showSaveFilePicker({
+                suggestedName: "merged.pdf",
+                types: [{
+                  description: "PDF Document",
+                  accept: { "application/pdf": [".pdf"] }
+                }]
+              });
+              const writable = await handle.createWritable();
+              await writable.write(blob);
+              await writable.close();
+              setStatus(`${result.documents.length}개 파일, ${result.pageCount}페이지 병합 및 저장이 완료되었습니다.`);
+            } catch (err) {
+              if (err.name !== "AbortError") {
+                throw err;
+              } else {
+                setStatus("저장이 취소되었습니다.");
+              }
+            }
+          } else {
+            downloadUrl = URL.createObjectURL(blob);
+            const link = document.createElement("a");
+            link.href = downloadUrl;
+            link.download = "merged.pdf";
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+            setStatus(`${result.documents.length}개 파일, ${result.pageCount}페이지 병합이 완료되었습니다. 다운로드가 시작되었습니다.`);
+          }
+        } catch (error) {
+          setStatus(error.message || "PDF 병합 중 오류가 발생했습니다.", "error");
+        } finally {
+          render();
+        }
+      }
+
+      fileInput.addEventListener("change", async () => {
+        await addFiles(fileInput.files);
+        fileInput.value = "";
+      });
+
+      clearButton.addEventListener("click", () => {
+        revokeDownload();
+        files = [];
+        sortSelect.value = "manual";
+        setStatus("");
+        render();
+      });
+
+      mergeButton.addEventListener("click", mergeFiles);
+      sortSelect.addEventListener("change", () => applySort(sortSelect.value));
+
+      dropZone.addEventListener("dragover", (event) => {
+        event.preventDefault();
+        if (Array.from(event.dataTransfer.types).includes("Files")) {
+          dropZone.classList.add("is-over");
+        }
+      });
+
+      dropZone.addEventListener("dragleave", () => {
+        dropZone.classList.remove("is-over");
+      });
+
+      dropZone.addEventListener("drop", async (event) => {
+        event.preventDefault();
+        dropZone.classList.remove("is-over");
+        if (event.dataTransfer.files && event.dataTransfer.files.length > 0) {
+          await addFiles(event.dataTransfer.files);
+        }
+      });
+
+      render();
+    </script>
+  </body>
+</html>
