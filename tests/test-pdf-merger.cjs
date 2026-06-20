@@ -1,4 +1,5 @@
 const assert = require("node:assert/strict");
+const zlib = require("node:zlib");
 const {
   PdfMergeError,
   analyzePdfDocument,
@@ -45,6 +46,8 @@ function assertThrowsPdfError(action, expectedText) {
   );
 }
 
+// ─── Basic merge tests ───
+
 const firstPdf = makeSinglePagePdf("first");
 const secondPdf = makeSinglePagePdf("second");
 
@@ -79,16 +82,7 @@ assert.deepEqual(
   ["second.pdf", "first.pdf"]
 );
 
-const objectStreamPdf = buildPdf([
-  "<< /Type /Catalog /Pages 2 0 R >>",
-  "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
-  "<< /Type /Page /Parent 2 0 R >>",
-  "<< /Type /ObjStm /N 0 /First 0 /Length 0 >>\nstream\n\nendstream"
-]);
-assertThrowsPdfError(
-  () => analyzePdfDocument(objectStreamPdf, "object-stream.pdf"),
-  "object streams"
-);
+// ─── Encrypted PDF test ───
 
 const encryptedPdf = buildPdf(
   [
@@ -102,5 +96,69 @@ assertThrowsPdfError(
   () => analyzePdfDocument(encryptedPdf, "encrypted.pdf"),
   "Encrypted"
 );
+
+// ─── Inflate unit test ───
+
+const testString = "Hello, PDF Object Stream World!";
+const testBytes = Buffer.from(testString, "utf-8");
+const compressed = zlib.deflateSync(testBytes);
+const decompressed = _internal.decompressFlateDecode(new Uint8Array(compressed));
+assert.equal(
+  _internal.bytesToBinaryString(decompressed),
+  testString,
+  "FlateDecode round-trip should produce original data"
+);
+
+// ─── Object Stream test (uncompressed) ───
+
+const page11Body = "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] >>";
+const font12Body = "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>";
+const objStmIndex = "11 0 12 " + page11Body.length;
+const objStmFirst = objStmIndex.length + 1;
+const objStmStream = objStmIndex + "\n" + page11Body + font12Body;
+
+const uncompressedObjStmPdf = buildPdf([
+  "<< /Type /Catalog /Pages 2 0 R >>",
+  "<< /Type /Pages /Kids [11 0 R] /Count 1 >>",
+  `<< /Type /ObjStm /N 2 /First ${objStmFirst} /Length ${objStmStream.length} >>\nstream\n${objStmStream}\nendstream`
+]);
+
+const uncompressedResult = analyzePdfDocument(uncompressedObjStmPdf, "uncompressed-objstm.pdf");
+assert.equal(uncompressedResult.pageCount, 1, "Uncompressed ObjStm: should find 1 page");
+
+// ─── Object Stream test (FlateDecode compressed) ───
+
+const compressedStreamData = zlib.deflateSync(Buffer.from(objStmStream, "binary"));
+const compressedStreamStr = _internal.bytesToBinaryString(compressedStreamData);
+
+const compressedObjStmPdf = buildPdf([
+  "<< /Type /Catalog /Pages 2 0 R >>",
+  "<< /Type /Pages /Kids [11 0 R] /Count 1 >>",
+  `<< /Type /ObjStm /N 2 /First ${objStmFirst} /Filter /FlateDecode /Length ${compressedStreamData.length} >>\nstream\n${compressedStreamStr}\nendstream`
+]);
+
+const compressedResult = analyzePdfDocument(compressedObjStmPdf, "compressed-objstm.pdf");
+assert.equal(compressedResult.pageCount, 1, "FlateDecode ObjStm: should find 1 page");
+
+// ─── Merge ObjStm PDF with normal PDF ───
+
+const objStmMerged = mergePdfDocuments([
+  { name: "objstm.pdf", data: compressedObjStmPdf },
+  { name: "normal.pdf", data: firstPdf }
+]);
+assert.equal(objStmMerged.pageCount, 2, "Merging ObjStm PDF with normal PDF should produce 2 pages");
+assert.equal(
+  analyzePdfDocument(objStmMerged.bytes, "merged-objstm.pdf").pageCount,
+  2,
+  "Re-analyzing merged ObjStm output should find 2 pages"
+);
+
+// ─── Merge two ObjStm PDFs ───
+
+const objStmMerged2 = mergePdfDocuments([
+  { name: "objstm1.pdf", data: compressedObjStmPdf },
+  { name: "objstm2.pdf", data: uncompressedObjStmPdf }
+]);
+assert.equal(objStmMerged2.pageCount, 2, "Merging two ObjStm PDFs should produce 2 pages");
 
 console.log("pdf-merger tests passed");

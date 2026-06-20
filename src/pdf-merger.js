@@ -287,25 +287,17 @@
     if (/\/Encrypt\b/.test(text)) {
       throw new PdfMergeError("Encrypted or password-protected PDFs are not supported.", fileName);
     }
-
-    for (const object of objects) {
-      if (hasType(object.body, "ObjStm")) {
-        throw new PdfMergeError(
-          "PDF object streams are not supported by this no-library merger.",
-          fileName
-        );
-      }
-    }
   }
 
   function analyzePdfDocument(data, fileName) {
     const text = typeof data === "string" ? data : bytesToBinaryString(data);
-    const objects = extractObjects(text, fileName);
+    let objects = extractObjects(text, fileName);
     if (objects.length === 0) {
       throw new PdfMergeError("No readable PDF objects were found.", fileName);
     }
 
     assertSupportedPdf(text, objects, fileName);
+    objects = unpackObjectStreams(objects, fileName);
 
     const objectMap = getObjectMap(objects);
     const catalogInfo = findCatalog(objects, fileName);
@@ -517,14 +509,302 @@
     };
   }
 
+  // ─── RFC 1951 deflate decompression (pure JS, no dependencies) ───
+
+  const INFLATE_LEN_BASE = [3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,35,43,51,59,67,83,99,115,131,163,195,227,258];
+  const INFLATE_LEN_EXTRA = [0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,0];
+  const INFLATE_DIST_BASE = [1,2,3,4,5,7,9,13,17,25,33,49,65,97,129,193,257,385,513,769,1025,1537,2049,3073,4097,6145,8193,12289,16385,24577];
+  const INFLATE_DIST_EXTRA = [0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,12,13,13];
+  const INFLATE_CL_ORDER = [16,17,18,0,8,7,9,6,10,5,11,4,12,3,13,2,14,1,15];
+
+  function buildInflateHuffmanTable(lengths, count) {
+    let maxBits = 0;
+    for (let i = 0; i < count; i++) {
+      if (lengths[i] > maxBits) maxBits = lengths[i];
+    }
+    if (maxBits === 0) return { bits: 0, table: new Int32Array(1) };
+
+    const blCount = new Array(maxBits + 1).fill(0);
+    for (let i = 0; i < count; i++) {
+      if (lengths[i]) blCount[lengths[i]]++;
+    }
+
+    const nextCode = new Array(maxBits + 1);
+    let code = 0;
+    nextCode[0] = 0;
+    for (let b = 1; b <= maxBits; b++) {
+      code = (code + blCount[b - 1]) << 1;
+      nextCode[b] = code;
+    }
+
+    const size = 1 << maxBits;
+    const table = new Int32Array(size).fill(-1);
+
+    for (let sym = 0; sym < count; sym++) {
+      const len = lengths[sym];
+      if (len === 0) continue;
+      let c = nextCode[len]++;
+      let rev = 0;
+      for (let j = 0; j < len; j++) {
+        rev = (rev << 1) | (c & 1);
+        c >>= 1;
+      }
+      const entry = (sym << 8) | len;
+      const step = 1 << len;
+      for (let idx = rev; idx < size; idx += step) {
+        table[idx] = entry;
+      }
+    }
+
+    return { bits: maxBits, table };
+  }
+
+  const INFLATE_FIXED_LIT = (function () {
+    const lens = new Array(288);
+    for (let i = 0; i <= 143; i++) lens[i] = 8;
+    for (let i = 144; i <= 255; i++) lens[i] = 9;
+    for (let i = 256; i <= 279; i++) lens[i] = 7;
+    for (let i = 280; i <= 287; i++) lens[i] = 8;
+    return buildInflateHuffmanTable(lens, 288);
+  })();
+
+  const INFLATE_FIXED_DIST = (function () {
+    const lens = new Array(32).fill(5);
+    return buildInflateHuffmanTable(lens, 32);
+  })();
+
+  function inflateRaw(src) {
+    const input = src instanceof Uint8Array ? src : new Uint8Array(src);
+    const inputLen = input.length;
+    let pos = 0;
+    let bitBuf = 0;
+    let bitCnt = 0;
+    const output = [];
+
+    function readBits(n) {
+      while (bitCnt < n) {
+        if (pos >= inputLen) throw new PdfMergeError("Unexpected end of compressed data.");
+        bitBuf |= input[pos++] << bitCnt;
+        bitCnt += 8;
+      }
+      const val = bitBuf & ((1 << n) - 1);
+      bitBuf >>>= n;
+      bitCnt -= n;
+      return val;
+    }
+
+    function huffDecode(ht) {
+      while (bitCnt < ht.bits) {
+        if (pos >= inputLen) throw new PdfMergeError("Unexpected end of compressed data.");
+        bitBuf |= input[pos++] << bitCnt;
+        bitCnt += 8;
+      }
+      const entry = ht.table[bitBuf & ((1 << ht.bits) - 1)];
+      if (entry < 0) throw new PdfMergeError("Invalid Huffman code in compressed data.");
+      const len = entry & 0xFF;
+      bitBuf >>>= len;
+      bitCnt -= len;
+      return entry >>> 8;
+    }
+
+    function decodeBlock(litHt, distHt) {
+      for (;;) {
+        const sym = huffDecode(litHt);
+        if (sym < 256) {
+          output.push(sym);
+        } else if (sym === 256) {
+          return;
+        } else {
+          const li = sym - 257;
+          const length = INFLATE_LEN_BASE[li] + (INFLATE_LEN_EXTRA[li] ? readBits(INFLATE_LEN_EXTRA[li]) : 0);
+          const di = huffDecode(distHt);
+          const distance = INFLATE_DIST_BASE[di] + (INFLATE_DIST_EXTRA[di] ? readBits(INFLATE_DIST_EXTRA[di]) : 0);
+          const from = output.length - distance;
+          for (let k = 0; k < length; k++) {
+            output.push(output[from + k]);
+          }
+        }
+      }
+    }
+
+    let bfinal;
+    do {
+      bfinal = readBits(1);
+      const btype = readBits(2);
+
+      if (btype === 0) {
+        bitBuf = 0;
+        bitCnt = 0;
+        const len = input[pos] | (input[pos + 1] << 8);
+        pos += 4;
+        for (let i = 0; i < len; i++) {
+          output.push(input[pos++]);
+        }
+      } else if (btype === 1) {
+        decodeBlock(INFLATE_FIXED_LIT, INFLATE_FIXED_DIST);
+      } else if (btype === 2) {
+        const hlit = readBits(5) + 257;
+        const hdist = readBits(5) + 1;
+        const hclen = readBits(4) + 4;
+
+        const clLens = new Array(19).fill(0);
+        for (let ci = 0; ci < hclen; ci++) {
+          clLens[INFLATE_CL_ORDER[ci]] = readBits(3);
+        }
+        const clHt = buildInflateHuffmanTable(clLens, 19);
+
+        const allLens = [];
+        while (allLens.length < hlit + hdist) {
+          const csym = huffDecode(clHt);
+          if (csym < 16) {
+            allLens.push(csym);
+          } else if (csym === 16) {
+            const rep = readBits(2) + 3;
+            const prev = allLens[allLens.length - 1] || 0;
+            for (let r = 0; r < rep; r++) allLens.push(prev);
+          } else if (csym === 17) {
+            const rep = readBits(3) + 3;
+            for (let r = 0; r < rep; r++) allLens.push(0);
+          } else {
+            const rep = readBits(7) + 11;
+            for (let r = 0; r < rep; r++) allLens.push(0);
+          }
+        }
+
+        decodeBlock(
+          buildInflateHuffmanTable(allLens.slice(0, hlit), hlit),
+          buildInflateHuffmanTable(allLens.slice(hlit), hdist)
+        );
+      } else {
+        throw new PdfMergeError("Invalid deflate block type.");
+      }
+    } while (!bfinal);
+
+    return new Uint8Array(output);
+  }
+
+  // ─── FlateDecode (zlib wrapper → inflate) ───
+
+  function decompressFlateDecode(streamBytes) {
+    const bytes = streamBytes instanceof Uint8Array ? streamBytes : new Uint8Array(streamBytes);
+    if (bytes.length < 2) throw new PdfMergeError("FlateDecode stream is too short.");
+    let offset = 2;
+    if (bytes[1] & 0x20) offset += 4;
+    return inflateRaw(bytes.subarray(offset));
+  }
+
+  // ─── Object Stream unpacking ───
+
+  function getStreamFilter(dictText) {
+    const match = dictText.match(/\/Filter\s+\[?\s*\/(\w+)/);
+    return match ? match[1] : "";
+  }
+
+  function getIntFromDict(dictText, name) {
+    const pattern = new RegExp("/" + name + "\\s+(\\d+)");
+    const match = dictText.match(pattern);
+    return match ? Number(match[1]) : -1;
+  }
+
+  function extractRawStreamBytes(body) {
+    const streamIdx = findKeyword(body, "stream", 0);
+    if (streamIdx === -1) return null;
+    const dataStart = streamDataStart(body, streamIdx + "stream".length);
+    const endStreamIdx = findKeyword(body, "endstream", dataStart);
+    if (endStreamIdx === -1) return null;
+    return binaryStringToBytes(body.slice(dataStart, endStreamIdx));
+  }
+
+  function unpackOneObjectStream(object, fileName) {
+    const dictEnd = object.body.indexOf("stream");
+    if (dictEnd === -1) {
+      throw new PdfMergeError("Object stream has no stream data.", fileName);
+    }
+    const dictText = object.body.slice(0, dictEnd);
+
+    const n = getIntFromDict(dictText, "N");
+    const first = getIntFromDict(dictText, "First");
+    if (n <= 0 || first < 0) {
+      throw new PdfMergeError("Object stream has invalid /N or /First.", fileName);
+    }
+
+    const filter = getStreamFilter(dictText);
+    const rawBytes = extractRawStreamBytes(object.body);
+    if (!rawBytes) {
+      throw new PdfMergeError("Could not extract object stream data.", fileName);
+    }
+
+    let decoded;
+    if (filter === "FlateDecode") {
+      decoded = bytesToBinaryString(decompressFlateDecode(rawBytes));
+    } else if (filter === "") {
+      decoded = bytesToBinaryString(rawBytes);
+    } else {
+      throw new PdfMergeError(
+        "Unsupported object stream filter: /" + filter + ".",
+        fileName
+      );
+    }
+
+    const dataPart = decoded.slice(first);
+    const indexPart = decoded.slice(0, first);
+    const indexTokens = indexPart.trim().split(/\s+/);
+    if (indexTokens.length < n * 2) {
+      throw new PdfMergeError("Object stream index is incomplete.", fileName);
+    }
+
+    const unpacked = [];
+    for (let i = 0; i < n; i++) {
+      const objNumber = Number(indexTokens[i * 2]);
+      const offset = Number(indexTokens[i * 2 + 1]);
+      const nextOffset = i < n - 1 ? Number(indexTokens[(i + 1) * 2 + 1]) : dataPart.length;
+      const objBody = dataPart.slice(offset, nextOffset).trim();
+
+      if (objBody.length > 0) {
+        unpacked.push({
+          number: objNumber,
+          generation: 0,
+          key: objectKey(objNumber, 0),
+          body: objBody
+        });
+      }
+    }
+
+    return unpacked;
+  }
+
+  function unpackObjectStreams(objects, fileName) {
+    const unpackedObjects = [];
+    let hasObjStm = false;
+
+    for (let i = 0; i < objects.length; i++) {
+      if (hasType(objects[i].body, "ObjStm")) {
+        hasObjStm = true;
+        const inner = unpackOneObjectStream(objects[i], fileName);
+        for (let j = 0; j < inner.length; j++) {
+          unpackedObjects.push(inner[j]);
+        }
+      }
+    }
+
+    if (!hasObjStm) return objects;
+
+    const filtered = objects.filter(function (obj) {
+      return !hasType(obj.body, "ObjStm");
+    });
+
+    return filtered.concat(unpackedObjects);
+  }
+
   function parseDocument(input, fileName) {
     const text = typeof input === "string" ? input : bytesToBinaryString(input);
-    const objects = extractObjects(text, fileName);
+    let objects = extractObjects(text, fileName);
     if (objects.length === 0) {
       throw new PdfMergeError("No readable PDF objects were found.", fileName);
     }
 
     assertSupportedPdf(text, objects, fileName);
+    objects = unpackObjectStreams(objects, fileName);
 
     const objectMap = getObjectMap(objects);
     const catalogInfo = findCatalog(objects, fileName);
@@ -648,7 +928,10 @@
       extractObjects,
       parseDocument,
       rewriteReferences,
-      transformOutsideStreams
+      transformOutsideStreams,
+      inflateRaw,
+      decompressFlateDecode,
+      unpackObjectStreams
     }
   };
 });
