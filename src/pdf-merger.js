@@ -696,7 +696,7 @@
   // ─── Object Stream unpacking ───
 
   function getStreamFilter(dictText) {
-    const match = dictText.match(/\/Filter\s+\[?\s*\/(\w+)/);
+    const match = dictText.match(/\/Filter\s*(?:\[\s*)?\/([A-Za-z0-9]+)/);
     return match ? match[1] : "";
   }
 

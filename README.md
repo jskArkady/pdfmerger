@@ -36,7 +36,7 @@ python3 -m http.server 8000
 지원하지 않는 PDF:
 
 - 암호화되었거나 비밀번호가 필요한 PDF
-- PDF object stream을 사용하는 일부 PDF
+- `/FlateDecode` 외 다른 필터로 압축된 object stream PDF
 - 객체 구조가 손상된 PDF
 
 파일 크기가 크거나 파일 수가 많으면 브라우저 메모리 사용량이 커질 수 있습니다.

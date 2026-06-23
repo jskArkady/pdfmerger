@@ -134,7 +134,7 @@ const compressedStreamStr = _internal.bytesToBinaryString(compressedStreamData);
 const compressedObjStmPdf = buildPdf([
   "<< /Type /Catalog /Pages 2 0 R >>",
   "<< /Type /Pages /Kids [11 0 R] /Count 1 >>",
-  `<< /Type /ObjStm /N 2 /First ${objStmFirst} /Filter /FlateDecode /Length ${compressedStreamData.length} >>\nstream\n${compressedStreamStr}\nendstream`
+  `<< /Type /ObjStm /N 2 /First ${objStmFirst} /Filter/FlateDecode /Length ${compressedStreamData.length} >>\nstream\n${compressedStreamStr}\nendstream`
 ]);
 
 const compressedResult = analyzePdfDocument(compressedObjStmPdf, "compressed-objstm.pdf");
