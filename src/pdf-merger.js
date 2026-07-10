@@ -96,27 +96,7 @@
   }
 
   function findObjectEnd(text, bodyStart) {
-    let cursor = bodyStart;
-    while (cursor < text.length) {
-      const endObjectIndex = findKeyword(text, "endobj", cursor);
-      if (endObjectIndex === -1) {
-        return -1;
-      }
-
-      const streamIndex = findKeyword(text, "stream", cursor);
-      if (streamIndex !== -1 && streamIndex < endObjectIndex) {
-        const dataStart = streamDataStart(text, streamIndex + "stream".length);
-        const endStreamIndex = findKeyword(text, "endstream", dataStart);
-        if (endStreamIndex === -1) {
-          return -1;
-        }
-        cursor = endStreamIndex + "endstream".length;
-        continue;
-      }
-
-      return endObjectIndex;
-    }
-    return -1;
+    return findSyntaxKeyword(text, "endobj", bodyStart);
   }
 
   function extractObjects(text, fileName) {
@@ -150,6 +130,7 @@
         number,
         generation,
         key,
+        sourceOffset: match.index,
         body: text.slice(bodyStart, bodyEnd)
       });
       cursor = bodyEnd + "endobj".length;
@@ -163,43 +144,46 @@
   }
 
   function hasType(body, typeName) {
-    return new RegExp(`/Type\\s*/${typeName}\\b`).test(body);
+    return Boolean(findSyntaxMatch(body, new RegExp(`/Type\\s*/${typeName}\\b`)));
   }
 
   function getReference(body, name) {
     const pattern = new RegExp(`/${name}\\s+(\\d+)\\s+(\\d+)\\s+R\\b`);
-    const match = body.match(pattern);
-    return match ? objectKey(match[1], match[2]) : "";
+    const result = findSyntaxMatch(body, pattern);
+    return result ? objectKey(result.match[1], result.match[2]) : "";
+  }
+
+  function getLastReference(body, name) {
+    const pattern = new RegExp(`/${name}\\s+(\\d+)\\s+(\\d+)\\s+R\\b`, "g");
+    let result = "";
+    visitSyntaxSegments(body, function (segment) {
+      pattern.lastIndex = 0;
+      let match = pattern.exec(segment);
+      while (match) {
+        result = objectKey(match[1], match[2]);
+        match = pattern.exec(segment);
+      }
+    });
+    return result;
   }
 
   function getCount(body) {
-    const match = body.match(/\/Count\s+(-?\d+)/);
-    return match ? Number(match[1]) : 0;
+    const result = findSyntaxMatch(body, /\/Count\s+(-?\d+)/);
+    return result ? Number(result.match[1]) : 0;
   }
 
   function findArrayBounds(body, name) {
-    const nameIndex = body.indexOf(`/${name}`);
-    if (nameIndex === -1) {
+    const result = findSyntaxMatch(body, new RegExp(`/${name}\\s*\\[`));
+    if (!result) {
       return null;
     }
 
-    const openIndex = body.indexOf("[", nameIndex);
-    if (openIndex === -1) {
+    const openIndex = result.index + result.match[0].lastIndexOf("[");
+    const arrayValue = readBalanced(body, openIndex, "[", "]");
+    if (!arrayValue.value) {
       return null;
     }
-
-    let depth = 0;
-    for (let index = openIndex; index < body.length; index += 1) {
-      if (body[index] === "[") {
-        depth += 1;
-      } else if (body[index] === "]") {
-        depth -= 1;
-        if (depth === 0) {
-          return [openIndex, index];
-        }
-      }
-    }
-    return null;
+    return [openIndex, arrayValue.end - 1];
   }
 
   function getKids(body) {
@@ -267,7 +251,22 @@
     return visit(rootKey);
   }
 
-  function findCatalog(objects, fileName) {
+  function findCatalog(objects, fileName, rootKey) {
+    if (rootKey) {
+      const rootObject = objects.find(function (object) {
+        return object.key === rootKey;
+      });
+      if (!rootObject || !hasType(rootObject.body, "Catalog")) {
+        throw new PdfMergeError("The PDF trailer points to a missing catalog.", fileName);
+      }
+
+      const pagesKey = getReference(rootObject.body, "Pages");
+      if (!pagesKey) {
+        throw new PdfMergeError("The PDF catalog has no page tree reference.", fileName);
+      }
+      return { catalog: rootObject, pagesKey };
+    }
+
     for (const object of objects) {
       if (hasType(object.body, "Catalog")) {
         const pagesKey = getReference(object.body, "Pages");
@@ -279,65 +278,161 @@
     throw new PdfMergeError("PDF catalog or page tree was not found.", fileName);
   }
 
-  function assertSupportedPdf(text, objects, fileName) {
+  function assertSupportedPdf(text, fileName) {
     if (!text.includes(PDF_HEADER)) {
       throw new PdfMergeError("Only PDF files can be merged.", fileName);
     }
 
-    if (/\/Encrypt\b/.test(text)) {
+    if (findSyntaxMatch(text, /\/Encrypt\b/)) {
       throw new PdfMergeError("Encrypted or password-protected PDFs are not supported.", fileName);
     }
   }
 
   function analyzePdfDocument(data, fileName) {
-    const text = typeof data === "string" ? data : bytesToBinaryString(data);
-    let objects = extractObjects(text, fileName);
-    if (objects.length === 0) {
-      throw new PdfMergeError("No readable PDF objects were found.", fileName);
-    }
-
-    assertSupportedPdf(text, objects, fileName);
-    objects = unpackObjectStreams(objects, fileName);
-
-    const objectMap = getObjectMap(objects);
-    const catalogInfo = findCatalog(objects, fileName);
-    if (!objectMap.has(catalogInfo.pagesKey)) {
-      throw new PdfMergeError("The catalog points to a missing page tree.", fileName);
-    }
-
-    const pageCount = countPages(objectMap, catalogInfo.pagesKey, fileName);
+    const document = parseDocument(data, fileName);
     return {
-      name: fileName || "document.pdf",
-      pageCount,
-      objectCount: objects.length,
-      pagesKey: catalogInfo.pagesKey
+      name: document.name,
+      pageCount: document.pageCount,
+      objectCount: document.objects.length,
+      pagesKey: document.pagesKey
     };
   }
 
-  function transformOutsideStreams(body, transform) {
-    let cursor = 0;
-    let output = "";
+  function skipLiteralString(text, startIndex) {
+    let depth = 0;
+    let index = startIndex;
 
-    while (cursor < body.length) {
-      const streamIndex = findKeyword(body, "stream", cursor);
-      if (streamIndex === -1) {
-        output += transform(body.slice(cursor));
-        break;
+    while (index < text.length) {
+      const character = text[index];
+      if (character === "\\") {
+        index += 2;
+        continue;
       }
-
-      const dataStart = streamDataStart(body, streamIndex + "stream".length);
-      const endStreamIndex = findKeyword(body, "endstream", dataStart);
-      if (endStreamIndex === -1) {
-        output += transform(body.slice(cursor));
-        break;
+      if (character === "(") {
+        depth += 1;
+      } else if (character === ")") {
+        depth -= 1;
+        if (depth === 0) {
+          return index + 1;
+        }
       }
-
-      output += transform(body.slice(cursor, streamIndex));
-      output += body.slice(streamIndex, endStreamIndex + "endstream".length);
-      cursor = endStreamIndex + "endstream".length;
+      index += 1;
     }
 
+    return text.length;
+  }
+
+  function skipComment(text, startIndex) {
+    let index = startIndex;
+    while (index < text.length && text[index] !== "\r" && text[index] !== "\n") {
+      index += 1;
+    }
+    return index;
+  }
+
+  function skipHexString(text, startIndex) {
+    const closeIndex = text.indexOf(">", startIndex + 1);
+    return closeIndex === -1 ? text.length : closeIndex + 1;
+  }
+
+  function isKeywordAt(text, keyword, index) {
+    return (
+      text.slice(index, index + keyword.length) === keyword &&
+      isBoundaryChar(index === 0 ? undefined : text[index - 1]) &&
+      isBoundaryChar(text[index + keyword.length])
+    );
+  }
+
+  function visitSyntaxSegments(body, visitor) {
+    let cursor = 0;
+    let segmentStart = 0;
+
+    while (cursor < body.length) {
+      let protectedEnd = -1;
+      if (body.slice(cursor, cursor + 2) === "<<") {
+        cursor += 2;
+        continue;
+      }
+      if (body[cursor] === "(") {
+        protectedEnd = skipLiteralString(body, cursor);
+      } else if (body[cursor] === "%") {
+        protectedEnd = skipComment(body, cursor);
+      } else if (body[cursor] === "<" && body[cursor + 1] !== "<") {
+        protectedEnd = skipHexString(body, cursor);
+      } else if (isKeywordAt(body, "stream", cursor)) {
+        const dataStart = streamDataStart(body, cursor + "stream".length);
+        const endStreamIndex = findKeyword(body, "endstream", dataStart);
+        protectedEnd = endStreamIndex === -1
+          ? body.length
+          : endStreamIndex + "endstream".length;
+      }
+
+      if (protectedEnd !== -1) {
+        if (
+          cursor > segmentStart &&
+          visitor(body.slice(segmentStart, cursor), segmentStart) === false
+        ) {
+          return;
+        }
+        cursor = protectedEnd;
+        segmentStart = protectedEnd;
+        continue;
+      }
+
+      cursor += 1;
+    }
+
+    if (segmentStart < body.length) {
+      visitor(body.slice(segmentStart), segmentStart);
+    }
+  }
+
+  function transformOutsideStreams(body, transform) {
+    let output = "";
+    let outputCursor = 0;
+
+    visitSyntaxSegments(body, function (segment, offset) {
+      output += body.slice(outputCursor, offset);
+      output += transform(segment, offset);
+      outputCursor = offset + segment.length;
+    });
+    output += body.slice(outputCursor);
     return output;
+  }
+
+  function findSyntaxMatch(body, pattern) {
+    let result = null;
+    visitSyntaxSegments(body, function (segment, offset) {
+      const match = segment.match(pattern);
+      if (match) {
+        result = {
+          match,
+          index: offset + match.index
+        };
+        return false;
+      }
+      return true;
+    });
+    return result;
+  }
+
+  function findSyntaxKeyword(body, keyword, fromIndex) {
+    const startIndex = Math.max(0, fromIndex || 0);
+    let result = -1;
+
+    visitSyntaxSegments(body, function (segment, offset) {
+      const segmentStart = Math.max(0, startIndex - offset);
+      if (segmentStart >= segment.length) {
+        return true;
+      }
+      const matchIndex = findKeyword(segment, keyword, segmentStart);
+      if (matchIndex !== -1) {
+        result = offset + matchIndex;
+        return false;
+      }
+      return true;
+    });
+    return result;
   }
 
   function rewriteReferences(body, idMap) {
@@ -350,9 +445,19 @@
   }
 
   function setParentReference(body, parentReference) {
+    const parentPattern = /\/Parent\s+\d+\s+\d+\s+R\b/;
+    const hasParent = Boolean(findSyntaxMatch(body, parentPattern));
+    let didUpdate = false;
+
     return transformOutsideStreams(body, function (segment) {
-      if (/\/Parent\s+\d+\s+\d+\s+R\b/.test(segment)) {
-        return segment.replace(/\/Parent\s+\d+\s+\d+\s+R\b/, `/Parent ${parentReference}`);
+      if (didUpdate) {
+        return segment;
+      }
+
+      if (hasParent) {
+        const updated = segment.replace(parentPattern, `/Parent ${parentReference}`);
+        didUpdate = updated !== segment;
+        return updated;
       }
 
       const dictionaryStart = segment.indexOf("<<");
@@ -360,6 +465,7 @@
         return segment;
       }
 
+      didUpdate = true;
       return (
         segment.slice(0, dictionaryStart + 2) +
         ` /Parent ${parentReference}` +
@@ -371,7 +477,7 @@
   function maybeCopyInheritedAttributes(objectMap, pageObject) {
     const existing = new Set();
     for (const attribute of PAGE_TREE_ATTRIBUTES) {
-      if (new RegExp(`/${attribute}\\b`).test(pageObject.body)) {
+      if (findSyntaxMatch(pageObject.body, new RegExp(`/${attribute}\\b`))) {
         existing.add(attribute);
       }
     }
@@ -413,12 +519,12 @@
   }
 
   function extractDictionaryValue(body, name) {
-    const nameIndex = body.indexOf(`/${name}`);
-    if (nameIndex === -1) {
+    const result = findSyntaxMatch(body, new RegExp(`/${name}\\b`));
+    if (!result) {
       return "";
     }
 
-    let cursor = nameIndex + name.length + 1;
+    let cursor = result.index + result.match[0].length;
     while (/\s/.test(body[cursor] || "")) {
       cursor += 1;
     }
@@ -457,6 +563,26 @@
     let depth = 0;
     let index = startIndex;
     while (index < body.length) {
+      if (body[index] === "(") {
+        index = skipLiteralString(body, index);
+        continue;
+      }
+      if (body[index] === "%") {
+        index = skipComment(body, index);
+        continue;
+      }
+      if (body[index] === "<" && body[index + 1] !== "<") {
+        index = skipHexString(body, index);
+        continue;
+      }
+      if (openToken === "[" && body.slice(index, index + 2) === "<<") {
+        index += 2;
+        continue;
+      }
+      if (openToken === "[" && body.slice(index, index + 2) === ">>") {
+        index += 2;
+        continue;
+      }
       if (body.slice(index, index + openToken.length) === openToken) {
         depth += 1;
         index += openToken.length;
@@ -765,6 +891,7 @@
           number: objNumber,
           generation: 0,
           key: objectKey(objNumber, 0),
+          sourceOffset: object.sourceOffset,
           body: objBody
         });
       }
@@ -796,18 +923,40 @@
     return filtered.concat(unpackedObjects);
   }
 
-  function parseDocument(input, fileName) {
+  function keepLatestObjectRevisions(objects) {
+    const latestRevisions = new Map();
+    objects.forEach(function (object, index) {
+      const sourceOffset = Number.isFinite(object.sourceOffset) ? object.sourceOffset : index;
+      const current = latestRevisions.get(object.key);
+      if (!current || sourceOffset >= current.sourceOffset) {
+        latestRevisions.set(object.key, { object, sourceOffset });
+      }
+    });
+    return objects.filter(function (object) {
+      return latestRevisions.get(object.key).object === object;
+    });
+  }
+
+  function readDocumentStructure(input, fileName) {
     const text = typeof input === "string" ? input : bytesToBinaryString(input);
-    let objects = extractObjects(text, fileName);
-    if (objects.length === 0) {
+    const extractedObjects = extractObjects(text, fileName);
+    if (extractedObjects.length === 0) {
       throw new PdfMergeError("No readable PDF objects were found.", fileName);
     }
 
-    assertSupportedPdf(text, objects, fileName);
-    objects = unpackObjectStreams(objects, fileName);
+    assertSupportedPdf(text, fileName);
+    return {
+      text,
+      objects: keepLatestObjectRevisions(unpackObjectStreams(extractedObjects, fileName))
+    };
+  }
+
+  function parseDocument(input, fileName) {
+    const structure = readDocumentStructure(input, fileName);
+    const objects = structure.objects;
 
     const objectMap = getObjectMap(objects);
-    const catalogInfo = findCatalog(objects, fileName);
+    const catalogInfo = findCatalog(objects, fileName, getLastReference(structure.text, "Root"));
     if (!objectMap.has(catalogInfo.pagesKey)) {
       throw new PdfMergeError("The catalog points to a missing page tree.", fileName);
     }
