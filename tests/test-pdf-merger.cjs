@@ -262,4 +262,95 @@ const objStmMerged2 = mergePdfDocuments([
 ]);
 assert.equal(objStmMerged2.pageCount, 2, "Merging two ObjStm PDFs should produce 2 pages");
 
+// Stream data must remain opaque even when it contains PDF structure keywords.
+const opaqueStream = "BT (prefix endstream 1 0 R literal\nendobj\n99 0 obj\n/Encrypt /Root 99 0 R\n\x00\xff) Tj ET";
+
+function makeStreamPdf(payload, lengthValue, ending = "\n", lengthBefore = false) {
+  const contentId = lengthBefore ? 5 : 4;
+  const objects = [
+    "<< /Type /Catalog /Pages 2 0 R >>",
+    "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 200 200] >>",
+    `<< /Type /Page /Parent 2 0 R /Contents ${contentId} 0 R >>`
+  ];
+  const streamObject = `<< /Note (stream /Length 1) /Nested << /Length 2 >> /Length ${lengthValue} >>${ending}stream${ending}${payload}${ending}endstream`;
+  if (lengthBefore) objects.push(String(payload.length), streamObject);
+  else objects.push(streamObject, String(payload.length));
+  return buildPdf(objects);
+}
+
+function assertStreamPreserved(pdf, payload) {
+  assert.equal(analyzePdfDocument(pdf, "opaque.pdf").pageCount, 1);
+  const result = mergePdfDocuments([{ name: "opaque.pdf", data: pdf }, { name: "other.pdf", data: firstPdf }]);
+  const text = _internal.bytesToBinaryString(result.bytes);
+  // Locate actual stream delimiters independently of the PDF parser under test.
+  const marker = /(?:\r\n|\r|\n)stream(?:\r\n|\r|\n)/.exec(text);
+  assert.ok(marker);
+  const start = marker.index + marker[0].length;
+  assert.deepEqual(result.bytes.slice(start, start + payload.length), _internal.binaryStringToBytes(payload));
+  assert.match(text.slice(0, marker.index), new RegExp(`/Length ${payload.length}(?:/Extra true)?\\s*>>$`));
+  assert.equal(analyzePdfDocument(result.bytes, "opaque-merged.pdf").pageCount, 2);
+}
+
+for (const ending of ["\n", "\r\n", "\r"]) {
+  assertStreamPreserved(makeStreamPdf(opaqueStream, opaqueStream.length, ending), opaqueStream);
+  assertStreamPreserved(makeStreamPdf(opaqueStream, "5 0 R", ending), opaqueStream);
+  assertStreamPreserved(makeStreamPdf(opaqueStream, "4 0 R", ending, true), opaqueStream);
+}
+assertStreamPreserved(makeStreamPdf("", 0), "");
+assertStreamPreserved(makeStreamPdf(opaqueStream, `5 % length reference\n0 R`), opaqueStream);
+assertStreamPreserved(makeStreamPdf(opaqueStream, "5 0 R/Extra true"), opaqueStream);
+
+for (const length of [opaqueStream.length - 1, opaqueStream.length + 2, 999999, -1, "null"]) {
+  assertThrowsPdfError(() => analyzePdfDocument(makeStreamPdf(opaqueStream, length), "bad-length.pdf"), "Length");
+}
+assertThrowsPdfError(() => analyzePdfDocument(makeStreamPdf(opaqueStream, "99 0 R"), "missing-length.pdf"), "indirect stream length");
+
+// Follow /Prev when an incremental xref table omits the unchanged length object.
+const indirectBase = _internal.bytesToBinaryString(makeStreamPdf(opaqueStream, "5 0 R"));
+const previousXref = Number(indirectBase.match(/startxref\s+(\d+)/)[1]);
+const incremental = indirectBase + `xref\n0 1\n0000000000 65535 f \ntrailer\n<< /Size 6 /Root 1 0 R /Prev ${previousXref} >>\nstartxref\n${indirectBase.length}\n%%EOF\n`;
+assertStreamPreserved(_internal.binaryStringToBytes(incremental), opaqueStream);
+
+function appendStreamRevision(base, payload) {
+  const previous = Number(base.match(/startxref\s+(\d+)\s+%%EOF\s*$/)[1]);
+  let text = base;
+  const streamOffset = text.length;
+  text += `4 0 obj\n<< /Length 5 0 R >>\nstream\n${payload}\nendstream\nendobj\n`;
+  const lengthOffset = text.length;
+  text += `5 0 obj\n${payload.length}\nendobj\n`;
+  const xrefOffset = text.length;
+  text += `xref\n4 2\n${String(streamOffset).padStart(10, "0")} 00000 n \n${String(lengthOffset).padStart(10, "0")} 00000 n \ntrailer\n<< /Size 6 /Root 1 0 R /Prev ${previous} >>\nstartxref\n${xrefOffset}\n%%EOF\n`;
+  return text;
+}
+const changedStream = opaqueStream + " longer";
+const changedRevision = appendStreamRevision(indirectBase, changedStream);
+assertStreamPreserved(_internal.binaryStringToBytes(changedRevision), changedStream);
+assertStreamPreserved(_internal.binaryStringToBytes(appendStreamRevision(changedRevision, "short")), "short");
+
+const fakeLengthPayload = opaqueStream + "\nendstream\nendobj\n5 0 obj\n1\nendobj\n";
+assertStreamPreserved(makeStreamPdf(fakeLengthPayload, "5 0 R"), fakeLengthPayload);
+const freeLength = indirectBase.replace(/(xref[\s\S]*?)(\d{10}) 00000 n (\ntrailer)/, "$10000000000 00001 f $3");
+assertThrowsPdfError(() => analyzePdfDocument(_internal.binaryStringToBytes(freeLength), "free-length.pdf"), "free or stale");
+
+const compactStreamPdf = buildPdf([
+  "<< /Type /Catalog /Pages 2 0 R >>",
+  "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+  "<< /Type /Page /Parent 2 0 R /Contents 4 0 R >>",
+  `<< /Type/XObject/Other 1/Ref 5 % reference\n0 R /Length ${opaqueStream.length}/Tag/Example >>\nstream\n${opaqueStream}\nendstream`,
+  "42"
+]);
+assert.equal(analyzePdfDocument(compactStreamPdf).pageCount, 1);
+
+// An ObjStm can itself contain a string with apparent stream delimiters.
+const embeddedPage = "<< /Type /Page /Parent 2 0 R /Note (endstream 1 0 R endobj) >>";
+const embeddedData = "11 0 " + embeddedPage;
+const embeddedPdf = buildPdf([
+  "<< /Type /Catalog /Pages 2 0 R >>",
+  "<< /Type /Pages /Kids [11 0 R] /Count 1 /MediaBox [0 0 200 200] >>",
+  `<< /Type /ObjStm /N 1 /First 5 /Length ${embeddedData.length} >>\nstream\n${embeddedData}\nendstream`
+]);
+assert.equal(analyzePdfDocument(embeddedPdf, "embedded.pdf").pageCount, 1);
+assert.ok(_internal.bytesToBinaryString(mergePdfDocuments([{data: embeddedPdf}]).bytes)
+  .includes("(endstream 1 0 R endobj)"));
+
 console.log("pdf-merger tests passed");

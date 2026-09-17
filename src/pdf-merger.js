@@ -95,8 +95,8 @@
     return streamKeywordEnd;
   }
 
-  function findObjectEnd(text, bodyStart) {
-    return findSyntaxKeyword(text, "endobj", bodyStart);
+  function findObjectEnd(text, bodyStart, onStream) {
+    return findSyntaxKeyword(text, "endobj", bodyStart, onStream);
   }
 
   function extractObjects(text, fileName) {
@@ -120,18 +120,36 @@
       const number = Number(match[1]);
       const generation = Number(match[2]);
       const bodyStart = objectPattern.lastIndex;
-      const bodyEnd = findObjectEnd(text, bodyStart);
+      let streamBounds = null;
+      let bodyEnd;
+      try {
+        bodyEnd = findObjectEnd(text, bodyStart, function (bounds) {
+          streamBounds = bounds;
+        });
+      } catch (error) {
+        if (error instanceof PdfMergeError) {
+          throw new PdfMergeError(error.message, fileName);
+        }
+        throw error;
+      }
       if (bodyEnd === -1) {
         throw new PdfMergeError("PDF object boundary could not be read.", fileName);
       }
 
       const key = objectKey(number, generation);
+      let body = text.slice(bodyStart, bodyEnd);
+      // Make an indirect length self-contained before processing this object alone.
+      if (streamBounds && streamBounds.lengthEntry.reference) {
+        const entry = streamBounds.lengthEntry;
+        body = body.slice(0, entry.start - bodyStart) + streamBounds.length +
+          body.slice(entry.end - bodyStart);
+      }
       objects.push({
         number,
         generation,
         key,
         sourceOffset: match.index,
-        body: text.slice(bodyStart, bodyEnd)
+        body
       });
       cursor = bodyEnd + "endobj".length;
     }
@@ -343,13 +361,189 @@
     );
   }
 
-  function visitSyntaxSegments(body, visitor) {
-    let cursor = 0;
-    let segmentStart = 0;
+  function skipPdfSpace(text, start) {
+    let cursor = start;
+    while (cursor < text.length) {
+      if (/[\x00\t\n\f\r ]/.test(text[cursor])) {
+        cursor += 1;
+      } else if (text[cursor] === "%") {
+        cursor = skipComment(text, cursor);
+      } else {
+        break;
+      }
+    }
+    return cursor;
+  }
+
+  // Only inspect keys in this dictionary, not keys inside nested values.
+  function readNumericEntry(text, dictionaryStart, name) {
+    let cursor = dictionaryStart + 2;
+    while (cursor < text.length) {
+      cursor = skipPdfSpace(text, cursor);
+      if (text.slice(cursor, cursor + 2) === ">>") return null;
+      const key = text.slice(cursor).match(/^\/([^\x00\t\n\f\r ()<>\[\]{}/%]+)/);
+      if (!key) break;
+      const decodedKey = key[1].replace(/#([\da-f]{2})/gi, (_, hex) =>
+        String.fromCharCode(parseInt(hex, 16)));
+      cursor = skipPdfSpace(text, cursor + key[0].length);
+      if (decodedKey === name) {
+        const first = text.slice(cursor).match(/^\+?\d+/);
+        if (!first || !(isBoundaryChar(text[cursor + first[0].length]) ||
+            text[cursor + first[0].length] === "/")) return null;
+        const end = cursor + first[0].length;
+        const secondStart = skipPdfSpace(text, end);
+        const second = text.slice(secondStart).match(/^\d+/);
+        if (second) {
+          const referenceStart = skipPdfSpace(text, secondStart + second[0].length);
+          if (text[referenceStart] === "R" &&
+              (isBoundaryChar(text[referenceStart + 1]) || text[referenceStart + 1] === "/")) {
+            return { start: cursor, end: referenceStart + 1,
+              reference: objectKey(first[0], second[0]) };
+          }
+        }
+        return { start: cursor, end, value: Number(first[0]) };
+      }
+      const scalar = text.slice(cursor).match(/^(?:\/[^\x00\t\n\f\r ()<>\[\]{}/%]+|[^\x00\t\n\f\r ()<>\[\]{}/%]+)/);
+      if (scalar) {
+        cursor += scalar[0].length;
+        if (/^\d+$/.test(scalar[0])) {
+          const secondStart = skipPdfSpace(text, cursor);
+          const second = text.slice(secondStart).match(/^\d+/);
+          if (second) {
+            const referenceStart = skipPdfSpace(text, secondStart + second[0].length);
+            if (text[referenceStart] === "R" &&
+                (isBoundaryChar(text[referenceStart + 1]) || text[referenceStart + 1] === "/")) {
+              cursor = referenceStart + 1;
+            }
+          }
+        }
+        continue;
+      }
+      const value = readPdfValue(text, cursor);
+      if (value.end <= cursor) {
+        if (text[cursor] === "<") cursor = skipHexString(text, cursor);
+        else break;
+      } else {
+        cursor = value.end;
+      }
+    }
+    return null;
+  }
+
+  function resolveStreamLength(text, reference, streamDictionaryStart) {
+    const start = text.match(/startxref\s+(\d+)\s+%%EOF\s*$/);
+    const visited = new Set();
+    const revisions = [];
+    let ownerNumber = -1;
+    let ownerOffset = -1;
+    let offset = start ? Number(start[1]) : -1;
+    while (Number.isSafeInteger(offset) && offset >= 0 && offset < text.length && !visited.has(offset)) {
+      visited.add(offset);
+      // Xref streams require a separate decoder; never guess an object's location.
+      if (!isKeywordAt(text, "xref", offset)) break;
+      const entries = new Map();
+      revisions.push(entries);
+      let cursor = skipPdfSpace(text, offset + 4);
+      while (!isKeywordAt(text, "trailer", cursor)) {
+        const subsection = text.slice(cursor).match(/^(\d+)\s+(\d+)\s+/);
+        if (!subsection) throw new PdfMergeError("Invalid cross-reference table for stream length.");
+        const first = Number(subsection[1]);
+        const count = Number(subsection[2]);
+        cursor += subsection[0].length;
+        for (let index = 0; index < count; index += 1) {
+          const entry = text.slice(cursor).match(/^(\d{10})[ \t]+(\d{5})[ \t]+([nf])(?:[ \t\r\n]+)/);
+          if (!entry) throw new PdfMergeError("Invalid cross-reference entry for stream length.");
+          cursor += entry[0].length;
+          const objectOffset = Number(entry[1]);
+          entries.set(first + index, { offset: objectOffset, generation: Number(entry[2]), active: entry[3] === "n" });
+          if (entry[3] === "n" && objectOffset < streamDictionaryStart) {
+            const header = text.slice(objectOffset).match(/^(\d+)\s+(\d+)\s+obj\b/);
+            if (header && skipPdfSpace(text, objectOffset + header[0].length) === streamDictionaryStart) {
+              ownerNumber = first + index;
+              ownerOffset = objectOffset;
+            }
+          }
+        }
+        cursor = skipPdfSpace(text, cursor);
+      }
+      const dictionaryStart = skipPdfSpace(text, cursor + "trailer".length);
+      const previous = readNumericEntry(text, dictionaryStart, "Prev");
+      offset = previous && !previous.reference ? previous.value : -1;
+    }
+    // Old stream revisions must use the length visible before they were replaced.
+    // Unchanged streams still see updates inherited from newer xref sections.
+    let revisionStart = 0;
+    let foundOwner = false;
+    for (let index = 0; index < revisions.length; index += 1) {
+      const owner = revisions[index].get(ownerNumber);
+      if (!owner) continue;
+      if (owner.active && owner.offset === ownerOffset) {
+        foundOwner = true;
+        break;
+      }
+      revisionStart = index + 1;
+    }
+    if (foundOwner) {
+      const number = Number(reference.split(" ")[0]);
+      for (const entries of revisions.slice(revisionStart)) {
+        const entry = entries.get(number);
+        if (!entry) continue;
+        if (!entry.active || objectKey(number, entry.generation) !== reference) {
+          throw new PdfMergeError("Stream length refers to a free or stale object.");
+        }
+        const header = text.slice(entry.offset).match(/^(\d+)\s+(\d+)\s+obj\b/);
+        if (!header || objectKey(header[1], header[2]) !== reference) {
+          throw new PdfMergeError("Cross-reference entry points to an invalid stream length object.");
+        }
+        const valueStart = skipPdfSpace(text, entry.offset + header[0].length);
+        const value = text.slice(valueStart).match(/^\+?\d+/);
+        if (value && isKeywordAt(text, "endobj", skipPdfSpace(text, valueStart + value[0].length))) {
+          return Number(value[0]);
+        }
+        throw new PdfMergeError("Stream length object is not a non-negative integer.");
+      }
+    }
+    throw new PdfMergeError("Cannot resolve indirect stream length from a classic cross-reference table.");
+  }
+
+  function readStreamBounds(text, streamStart, dictionaryStart) {
+    const lengthEntry = readNumericEntry(text, dictionaryStart, "Length");
+    if (!lengthEntry) throw new PdfMergeError("PDF stream has no valid /Length.");
+    const length = lengthEntry.reference
+      ? resolveStreamLength(text, lengthEntry.reference, dictionaryStart) : lengthEntry.value;
+    const keywordEnd = streamStart + "stream".length;
+    const dataStart = streamDataStart(text, keywordEnd);
+    if (dataStart === keywordEnd || !Number.isSafeInteger(length) || length < 0) {
+      throw new PdfMergeError("Invalid PDF stream length or line ending.");
+    }
+    const dataEnd = dataStart + length;
+    let endStream = dataEnd;
+    if (text.slice(endStream, endStream + 2) === "\r\n") endStream += 2;
+    else if (text[endStream] === "\r" || text[endStream] === "\n") endStream += 1;
+    // Length-delimited binary data need not end with a token boundary.
+    if (text.slice(endStream, endStream + 9) !== "endstream" ||
+        !isBoundaryChar(text[endStream + 9])) {
+      throw new PdfMergeError("PDF stream /Length does not match its endstream marker.");
+    }
+    return { streamStart, dataStart, dataEnd, end: endStream + 9, length, lengthEntry };
+  }
+
+  function visitSyntaxSegments(body, visitor, startIndex = 0, onStream) {
+    let cursor = startIndex;
+    let segmentStart = startIndex;
+    let dictionaryDepth = 0;
+    let dictionaryStart = -1;
 
     while (cursor < body.length) {
       let protectedEnd = -1;
       if (body.slice(cursor, cursor + 2) === "<<") {
+        if (dictionaryDepth === 0) dictionaryStart = cursor;
+        dictionaryDepth += 1;
+        cursor += 2;
+        continue;
+      }
+      if (body.slice(cursor, cursor + 2) === ">>") {
+        dictionaryDepth -= 1;
         cursor += 2;
         continue;
       }
@@ -360,11 +554,14 @@
       } else if (body[cursor] === "<" && body[cursor + 1] !== "<") {
         protectedEnd = skipHexString(body, cursor);
       } else if (isKeywordAt(body, "stream", cursor)) {
-        const dataStart = streamDataStart(body, cursor + "stream".length);
-        const endStreamIndex = findKeyword(body, "endstream", dataStart);
-        protectedEnd = endStreamIndex === -1
-          ? body.length
-          : endStreamIndex + "endstream".length;
+        if (cursor > segmentStart && visitor(body.slice(segmentStart, cursor), segmentStart) === false) {
+          return;
+        }
+        const bounds = readStreamBounds(body, cursor, dictionaryStart);
+        if (onStream) onStream(bounds);
+        cursor = bounds.end;
+        segmentStart = cursor;
+        continue;
       }
 
       if (protectedEnd !== -1) {
@@ -416,7 +613,7 @@
     return result;
   }
 
-  function findSyntaxKeyword(body, keyword, fromIndex) {
+  function findSyntaxKeyword(body, keyword, fromIndex, onStream) {
     const startIndex = Math.max(0, fromIndex || 0);
     let result = -1;
 
@@ -431,7 +628,7 @@
         return false;
       }
       return true;
-    });
+    }, startIndex, onStream);
     return result;
   }
 
@@ -832,21 +1029,20 @@
     return match ? Number(match[1]) : -1;
   }
 
-  function extractRawStreamBytes(body) {
-    const streamIdx = findKeyword(body, "stream", 0);
-    if (streamIdx === -1) return null;
-    const dataStart = streamDataStart(body, streamIdx + "stream".length);
-    const endStreamIdx = findKeyword(body, "endstream", dataStart);
-    if (endStreamIdx === -1) return null;
-    return binaryStringToBytes(body.slice(dataStart, endStreamIdx));
+  function findStreamBounds(body) {
+    let result = null;
+    visitSyntaxSegments(body, function () { return !result; }, 0, function (bounds) {
+      result = bounds;
+    });
+    return result;
   }
 
   function unpackOneObjectStream(object, fileName) {
-    const dictEnd = object.body.indexOf("stream");
-    if (dictEnd === -1) {
+    const bounds = findStreamBounds(object.body);
+    if (!bounds) {
       throw new PdfMergeError("Object stream has no stream data.", fileName);
     }
-    const dictText = object.body.slice(0, dictEnd);
+    const dictText = object.body.slice(0, bounds.streamStart);
 
     const n = getIntFromDict(dictText, "N");
     const first = getIntFromDict(dictText, "First");
@@ -855,10 +1051,7 @@
     }
 
     const filter = getStreamFilter(dictText);
-    const rawBytes = extractRawStreamBytes(object.body);
-    if (!rawBytes) {
-      throw new PdfMergeError("Could not extract object stream data.", fileName);
-    }
+    const rawBytes = binaryStringToBytes(object.body.slice(bounds.dataStart, bounds.dataEnd));
 
     let decoded;
     if (filter === "FlateDecode") {
