@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="ko">
+  <meta charset="utf-8">
+  <title>PDF merger UI tests</title>
+  <h1>PDF merger UI tests</h1>
+  <pre id="results">Running…</pre>
+  <iframe id="app" title="PDF merger under test" width="1100" height="800"></iframe>
+  <script src="pdf-fixtures.js"></script>
+  <script>
+    (async function () {
+      const results = document.getElementById("results");
+      const frame = document.getElementById("app");
+      const report = { passed: 0, failed: 0, errors: [] };
+      let caseNumber = 0;
+      const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
+      function assert(condition, message) {
+        if (!condition) throw new Error(message);
+      }
+      async function openApp() {
+        await new Promise((resolve) => {
+          frame.onload = resolve;
+          frame.src = "../index.html?test=" + (++caseNumber);
+        });
+        const w = frame.contentWindow;
+        const d = frame.contentDocument;
+        const get = (id) => d.getElementById(id);
+        const names = () => Array.from(d.querySelectorAll(".file-name"), (node) => node.textContent).join(",");
+        function select(namesToAdd) {
+          const transfer = new w.DataTransfer();
+          namesToAdd.forEach((name) => transfer.items.add(new w.File(
+            [PdfFixtures.makeSinglePagePdf(name)], name, { type: "application/pdf" }
+          )));
+          get("fileInput").files = transfer.files;
+          get("fileInput").dispatchEvent(new w.Event("change"));
+        }
+        function holdReads() {
+          const pending = [];
+          w.File.prototype.arrayBuffer = function () {
+            return new Promise((resolve, reject) => pending.push({
+              name: this.name,
+              resolve: () => resolve(PdfFixtures.makeSinglePagePdf(this.name).buffer),
+              reject: () => reject(new Error("test read failure"))
+            }));
+          };
+          return pending;
+        }
+        function sort(value) {
+          get("sortSelect").value = value;
+          get("sortSelect").dispatchEvent(new w.Event("change"));
+        }
+        return { w, d, get, names, select, holdReads, sort };
+      }
+      async function test(name, action) {
+        try {
+          await action(await openApp());
+          report.passed++;
+          results.textContent += "\nPASS " + name;
+        } catch (error) {
+          report.failed++;
+          report.errors.push(name + ": " + error.message);
+          results.textContent += "\nFAIL " + name + ": " + error.message;
+        }
+      }
+
+      results.textContent = "";
+      await test("latest sort wins after asynchronous reads", async (app) => {
+        assert(app.d.styleSheets.length === 1, "relative stylesheet did not load");
+        const pending = app.holdReads();
+        app.sort("nameAsc");
+        app.select(["a.pdf", "b.pdf"]);
+        app.sort("nameDesc");
+        pending.forEach((file) => file.resolve());
+        await tick();
+        assert(app.names() === "b.pdf,a.pdf", "old sort overwrote the current sort");
+        assert(!app.get("mergeButton").disabled, "ready files cannot merge");
+        assert(app.get("pageCount").textContent === "2", "page count differs");
+      });
+
+      await test("manual order survives pending reads", async (app) => {
+        const pending = app.holdReads();
+        app.sort("nameAsc");
+        app.select(["a.pdf", "b.pdf"]);
+        app.d.querySelectorAll(".move-up")[1].click();
+        pending[1].resolve();
+        pending[0].resolve();
+        await tick();
+        assert(app.names() === "b.pdf,a.pdf", "manual order was overwritten");
+        assert(app.get("sortSelect").value === "manual", "manual mode was lost");
+      });
+
+      await test("removed reads cannot block or report stale errors", async (app) => {
+        const pending = app.holdReads();
+        app.select(["removed.pdf", "kept.pdf"]);
+        app.d.querySelector(".remove").click();
+        pending[1].resolve();
+        await tick();
+        assert(!app.get("mergeButton").disabled, "removed pending read still blocks merging");
+        const status = app.get("status").textContent;
+        pending[0].reject();
+        await tick();
+        assert(app.names() === "kept.pdf", "removed file reappeared");
+        assert(app.get("status").textContent === status, "removed file published an error");
+      });
+
+      await test("clear isolates the next selection from old reads", async (app) => {
+        const pending = app.holdReads();
+        app.select(["old.pdf"]);
+        app.get("clearButton").click();
+        app.select(["new.pdf"]);
+        pending[1].resolve();
+        await tick();
+        const status = app.get("status").textContent;
+        pending[0].resolve();
+        await tick();
+        assert(app.names() === "new.pdf", "old selection was restored");
+        assert(app.get("status").textContent === status, "old read changed current status");
+      });
+
+      await test("overlapping selections track the whole queue", async (app) => {
+        const pending = app.holdReads();
+        app.select(["slow.pdf"]);
+        app.select(["fast.pdf"]);
+        pending[1].resolve();
+        await tick();
+        assert(app.get("mergeButton").disabled, "pending file allowed a merge");
+        assert(app.get("status").textContent.includes("확인하는 중"), "queue reported ready too early");
+        pending[0].reject();
+        await tick();
+        assert(app.get("mergeButton").disabled, "invalid file allowed a merge");
+        assert(app.get("status").classList.contains("is-error"), "read error is missing");
+        app.d.querySelector(".remove").click();
+        assert(!app.get("mergeButton").disabled, "removing invalid file did not unblock merging");
+      });
+
+      await test("save locks mutations and cancellation restores controls", async (app) => {
+        const pending = app.holdReads();
+        app.select(["a.pdf", "b.pdf"]);
+        pending.forEach((file) => file.resolve());
+        await tick();
+        let cancel;
+        app.w.showSaveFilePicker = () => new Promise((resolve, reject) => { cancel = reject; });
+        app.get("mergeButton").click();
+        for (const id of ["fileInput", "clearButton", "sortSelect", "mergeButton"]) {
+          assert(app.get(id).disabled, id + " remains enabled during save");
+        }
+        assert(Array.from(app.d.querySelectorAll(".remove"), (node) => node.disabled).every(Boolean), "remove buttons remain enabled");
+        app.select(["ignored.pdf"]);
+        assert(app.names() === "a.pdf,b.pdf", "file was added during save");
+        cancel(new app.w.DOMException("Cancelled", "AbortError"));
+        await tick();
+        assert(!app.get("mergeButton").disabled, "merge stayed locked after cancellation");
+        assert(!app.get("fileInput").disabled, "input stayed locked after cancellation");
+        assert(app.get("status").textContent.includes("취소"), "cancellation was not reported");
+      });
+
+      await test("download contains both PDFs in selected order", async (app) => {
+        const pending = app.holdReads();
+        app.select(["first.pdf", "second.pdf"]);
+        pending.forEach((file) => file.resolve());
+        await tick();
+        app.w.showSaveFilePicker = undefined;
+        let savedBlob;
+        let downloadName;
+        app.w.URL.createObjectURL = (blob) => { savedBlob = blob; return "blob:test"; };
+        app.w.HTMLAnchorElement.prototype.click = function () { downloadName = this.download; };
+        app.get("mergeButton").click();
+        assert(downloadName === "merged.pdf", "download was not started");
+        const bytes = new Uint8Array(await savedBlob.arrayBuffer());
+        const text = new TextDecoder("latin1").decode(bytes);
+        assert(text.includes("(first.pdf 1 0 R literal)"), "first page content was lost");
+        assert(text.includes("(second.pdf 1 0 R literal)"), "second page content was lost");
+        assert(text.indexOf("(first.pdf") < text.indexOf("(second.pdf"), "page order changed");
+        assert(app.w.PdfMerger.analyzePdfDocument(bytes).pageCount === 2, "merged page count differs");
+        assert(!app.get("mergeButton").disabled, "download left UI locked");
+      });
+
+      document.title = report.failed ? "FAIL: PDF merger UI tests" : "PASS: PDF merger UI tests";
+      results.textContent += `\n${report.passed} passed, ${report.failed} failed`;
+      window.testResults = report;
+    })();
+  </script>
+</html>

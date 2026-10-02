@@ -64,6 +64,7 @@
       character === ">" ||
       character === "{" ||
       character === "}" ||
+      character === "/" ||
       character === "%"
     );
   }
@@ -375,59 +376,39 @@
     return cursor;
   }
 
-  // Only inspect keys in this dictionary, not keys inside nested values.
-  function readNumericEntry(text, dictionaryStart, name) {
+  function decodePdfName(name) {
+    return name.replace(/#([\da-f]{2})/gi, (_, hex) =>
+      String.fromCharCode(parseInt(hex, 16)));
+  }
+
+  // Read one outer dictionary entry, skipping complete nested values.
+  function readDictionaryEntry(text, dictionaryStart, name) {
+    if (text.slice(dictionaryStart, dictionaryStart + 2) !== "<<") return null;
     let cursor = dictionaryStart + 2;
     while (cursor < text.length) {
       cursor = skipPdfSpace(text, cursor);
       if (text.slice(cursor, cursor + 2) === ">>") return null;
       const key = text.slice(cursor).match(/^\/([^\x00\t\n\f\r ()<>\[\]{}/%]+)/);
       if (!key) break;
-      const decodedKey = key[1].replace(/#([\da-f]{2})/gi, (_, hex) =>
-        String.fromCharCode(parseInt(hex, 16)));
       cursor = skipPdfSpace(text, cursor + key[0].length);
-      if (decodedKey === name) {
-        const first = text.slice(cursor).match(/^\+?\d+/);
-        if (!first || !(isBoundaryChar(text[cursor + first[0].length]) ||
-            text[cursor + first[0].length] === "/")) return null;
-        const end = cursor + first[0].length;
-        const secondStart = skipPdfSpace(text, end);
-        const second = text.slice(secondStart).match(/^\d+/);
-        if (second) {
-          const referenceStart = skipPdfSpace(text, secondStart + second[0].length);
-          if (text[referenceStart] === "R" &&
-              (isBoundaryChar(text[referenceStart + 1]) || text[referenceStart + 1] === "/")) {
-            return { start: cursor, end: referenceStart + 1,
-              reference: objectKey(first[0], second[0]) };
-          }
-        }
-        return { start: cursor, end, value: Number(first[0]) };
-      }
-      const scalar = text.slice(cursor).match(/^(?:\/[^\x00\t\n\f\r ()<>\[\]{}/%]+|[^\x00\t\n\f\r ()<>\[\]{}/%]+)/);
-      if (scalar) {
-        cursor += scalar[0].length;
-        if (/^\d+$/.test(scalar[0])) {
-          const secondStart = skipPdfSpace(text, cursor);
-          const second = text.slice(secondStart).match(/^\d+/);
-          if (second) {
-            const referenceStart = skipPdfSpace(text, secondStart + second[0].length);
-            if (text[referenceStart] === "R" &&
-                (isBoundaryChar(text[referenceStart + 1]) || text[referenceStart + 1] === "/")) {
-              cursor = referenceStart + 1;
-            }
-          }
-        }
-        continue;
-      }
       const value = readPdfValue(text, cursor);
-      if (value.end <= cursor) {
-        if (text[cursor] === "<") cursor = skipHexString(text, cursor);
-        else break;
-      } else {
-        cursor = value.end;
+      if (value.end <= cursor) break;
+      if (decodePdfName(key[1]) === name) {
+        return { ...value, start: cursor };
       }
+      cursor = value.end;
     }
     return null;
+  }
+
+  function readNumericEntry(text, dictionaryStart, name) {
+    const entry = readDictionaryEntry(text, dictionaryStart, name);
+    if (!entry) return null;
+    if (entry.reference) {
+      return { start: entry.start, end: entry.end, reference: entry.reference };
+    }
+    if (!/^\+?\d+$/.test(entry.value)) return null;
+    return { start: entry.start, end: entry.end, value: Number(entry.value) };
   }
 
   function resolveStreamLength(text, reference, streamDictionaryStart) {
@@ -740,16 +721,26 @@
     if (first === "(") {
       return readStringValue(body, startIndex);
     }
-
-    const referenceMatch = body.slice(startIndex).match(/^(\d+\s+\d+\s+R\b)/);
-    if (referenceMatch) {
-      return {
-        value: referenceMatch[1],
-        end: startIndex + referenceMatch[1].length
-      };
+    if (first === "<") {
+      const end = skipHexString(body, startIndex);
+      return { value: body.slice(startIndex, end), end };
     }
 
-    const tokenMatch = body.slice(startIndex).match(/^[^\s<>\[\]\(\){}%]+/);
+    const number = body.slice(startIndex).match(/^\+?\d+/);
+    if (number && isBoundaryChar(body[startIndex + number[0].length])) {
+      const generationStart = skipPdfSpace(body, startIndex + number[0].length);
+      const generation = body.slice(generationStart).match(/^\d+/);
+      if (generation && isBoundaryChar(body[generationStart + generation[0].length])) {
+        const referenceStart = skipPdfSpace(body, generationStart + generation[0].length);
+        if (body[referenceStart] === "R" && isBoundaryChar(body[referenceStart + 1])) {
+          const end = referenceStart + 1;
+          return { value: body.slice(startIndex, end), end,
+            reference: objectKey(number[0], generation[0]) };
+        }
+      }
+    }
+
+    const tokenMatch = body.slice(startIndex).match(/^\/?[^\x00\t\n\f\r ()<>\[\]{}/%]+/);
     return {
       value: tokenMatch ? tokenMatch[0] : "",
       end: startIndex + (tokenMatch ? tokenMatch[0].length : 0)
@@ -1018,15 +1009,28 @@
 
   // ─── Object Stream unpacking ───
 
-  function getStreamFilter(dictText) {
-    const match = dictText.match(/\/Filter\s*(?:\[\s*)?\/([A-Za-z0-9]+)/);
-    return match ? match[1] : "";
+  function getStreamFilter(dictText, fileName) {
+    const entry = readDictionaryEntry(dictText, skipPdfSpace(dictText, 0), "Filter");
+    if (!entry || entry.value === "null") return "";
+    let value = entry.value;
+    if (value[0] === "[") {
+      const start = skipPdfSpace(value, 1);
+      if (value[start] === "]") return "";
+      const filter = readPdfValue(value, start);
+      if (skipPdfSpace(value, filter.end) !== value.length - 1) {
+        throw new PdfMergeError("Unsupported object stream filter pipeline.", fileName);
+      }
+      value = filter.value;
+    }
+    if (!/^\/[^\x00\t\n\f\r ()<>\[\]{}/%]+$/.test(value)) {
+      throw new PdfMergeError("Invalid object stream filter.", fileName);
+    }
+    return decodePdfName(value.slice(1));
   }
 
   function getIntFromDict(dictText, name) {
-    const pattern = new RegExp("/" + name + "\\s+(\\d+)");
-    const match = dictText.match(pattern);
-    return match ? Number(match[1]) : -1;
+    const entry = readNumericEntry(dictText, skipPdfSpace(dictText, 0), name);
+    return entry && !entry.reference && Number.isSafeInteger(entry.value) ? entry.value : -1;
   }
 
   function findStreamBounds(body) {
@@ -1050,7 +1054,7 @@
       throw new PdfMergeError("Object stream has invalid /N or /First.", fileName);
     }
 
-    const filter = getStreamFilter(dictText);
+    const filter = getStreamFilter(dictText, fileName);
     const rawBytes = binaryStringToBytes(object.body.slice(bounds.dataStart, bounds.dataEnd));
 
     let decoded;

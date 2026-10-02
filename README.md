@@ -1,6 +1,6 @@
 # PDF 병합기
 
-브라우저에서 여러 PDF 파일을 하나로 합치는 단일 페이지 앱입니다. 별도 서버나 외부 라이브러리 없이 `index.html`과 `src/pdf-merger.js`만으로 동작합니다.
+브라우저에서 여러 PDF 파일을 하나로 합치는 단일 페이지 앱입니다. 자체 PDF 파서를 사용하며, 별도 서버 처리나 외부 라이브러리, 빌드 과정 없이 정적 파일만으로 동작합니다. 선택한 PDF는 브라우저 안에서 읽고 병합합니다.
 
 ## 사용 방법
 
@@ -18,6 +18,8 @@ python3 -m http.server 8000
 
 이후 브라우저에서 `http://localhost:8000`을 엽니다.
 
+GitHub Pages에서는 배포할 브랜치의 루트(`/`)를 게시 대상으로 선택하면 됩니다. `.nojekyll`로 정적 파일을 그대로 게시하며, CSS와 JavaScript는 상대경로로 불러와 `/pdfmerger/` 같은 프로젝트 하위 주소에서도 동작합니다.
+
 ## 기능
 
 - 여러 PDF 파일 선택
@@ -28,6 +30,8 @@ python3 -m http.server 8000
 - 브라우저 안에서 병합 PDF 생성
 - File System Access API 지원 브라우저에서는 저장 위치 선택
 - 그 외 브라우저에서는 `merged.pdf` 자동 다운로드
+- 파일을 읽는 동안 변경한 정렬·삭제 상태 유지
+- 병합·저장이 끝날 때까지 목록 변경과 중복 병합 방지
 
 ## 제한 사항
 
@@ -37,6 +41,7 @@ python3 -m http.server 8000
 
 - 암호화되었거나 비밀번호가 필요한 PDF
 - `/FlateDecode` 외 다른 필터로 압축된 object stream PDF
+- 여러 필터를 연속 적용한 object stream PDF
 - 스트림 `/Length`가 간접 참조이고, 해당 길이 객체를 일반 xref 테이블에서 찾을 수 없는 PDF (xref stream만 사용하는 경우 등)
 - 객체 구조가 손상된 PDF
 
@@ -49,9 +54,14 @@ python3 -m http.server 8000
 ```text
 .
 ├── index.html
+├── styles.css
+├── .nojekyll
 ├── src/
-│   └── pdf-merger.js
+│   ├── app.js             # 파일 목록, 화면 갱신, 저장 처리
+│   └── pdf-merger.js      # PDF 분석, 압축 해제, 병합 및 출력
 └── tests/
+    ├── pdf-fixtures.js    # Node.js와 브라우저에서 공유하는 테스트 PDF 생성기
+    ├── test-app.html      # 실제 브라우저 UI 회귀 테스트
     └── test-pdf-merger.cjs
 ```
 
@@ -67,5 +77,9 @@ node tests/test-pdf-merger.cjs
 
 ```sh
 node --check src/pdf-merger.js
+node --check src/app.js
+node --check tests/pdf-fixtures.js
 node --check tests/test-pdf-merger.cjs
 ```
+
+UI 회귀 테스트는 위의 로컬 서버를 실행한 다음 `http://localhost:8000/tests/test-app.html`을 브라우저에서 엽니다. 파일 읽기 완료 순서, 정렬 변경, 삭제와 전체 비우기, 저장 취소, 다운로드 결과를 검사합니다. 저장 선택창과 다운로드 시작은 테스트에서 대체하므로 OS 저장창의 실제 동작은 별도로 확인해야 합니다.
