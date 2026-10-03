@@ -7,7 +7,7 @@ const {
   _internal
 } = require("../src/pdf-merger.js");
 
-const { buildPdf, buildPdfWithRevisions, makeSinglePagePdf } = require("./pdf-fixtures.js");
+const { buildPdf, buildPdfWithRevisions, buildXrefStreamPdf, makeSinglePagePdf } = require("./pdf-fixtures.js");
 
 function assertThrowsPdfError(action, expectedText) {
   assert.throws(
@@ -36,10 +36,11 @@ assert.deepEqual(
 );
 assert.equal(analyzePdfDocument(merged.bytes, "merged.pdf").pageCount, 2);
 assert.ok(mergedText.startsWith("%PDF-1.7"));
-assert.match(mergedText, /<< \/Type \/Pages \/Kids \[4 0 R 9 0 R\] \/Count 2 >>/);
-assert.match(mergedText, /4 0 obj\s*<< \/Parent 2 0 R \/Type \/Pages/);
-assert.match(mergedText, /9 0 obj\s*<< \/Parent 2 0 R \/Type \/Pages/);
-assert.match(mergedText, /5 0 obj\s*<< \/Resources << \/Font << \/F1 6 0 R >> >> \/MediaBox \[0 0 200 200\]/);
+// IDs change when obsolete catalogs and unreferenced objects are excluded.
+const mergedStructure = _internal.parseDocument(merged.bytes);
+assert.equal(mergedStructure.objects.filter(o => /\/Type \/Catalog\b/.test(o.body)).length, 1);
+assert.equal(mergedStructure.objects.filter(o => /\/Type \/Page\b/.test(o.body)).length, 2);
+assert.equal(mergedStructure.objects.filter(o => /\/MediaBox \[0 0 200 200\]/.test(o.body)).length, 2);
 assert.ok(mergedText.includes("(first 1 0 R literal)"));
 assert.ok(mergedText.includes("(second 1 0 R literal)"));
 
@@ -163,11 +164,11 @@ const objStmIndex = "11 0 12 " + page11Body.length;
 const objStmFirst = objStmIndex.length + 1;
 const objStmStream = objStmIndex + "\n" + page11Body + font12Body;
 
-const uncompressedObjStmPdf = buildPdf([
+const uncompressedObjStmPdf = buildXrefStreamPdf([
   "<< /Type /Catalog /Pages 2 0 R >>",
   "<< /Type /Pages /Kids [11 0 R] /Count 1 >>",
   `<< /Type /ObjStm /N 2 /First ${objStmFirst} /Length ${objStmStream.length} >>\nstream\n${objStmStream}\nendstream`
-]);
+], {11: [3, 0], 12: [3, 1]});
 
 const uncompressedResult = analyzePdfDocument(uncompressedObjStmPdf, "uncompressed-objstm.pdf");
 assert.equal(uncompressedResult.pageCount, 1, "Uncompressed ObjStm: should find 1 page");
@@ -177,25 +178,20 @@ assert.equal(uncompressedResult.pageCount, 1, "Uncompressed ObjStm: should find 
 const compressedStreamData = zlib.deflateSync(Buffer.from(objStmStream, "binary"));
 const compressedStreamStr = _internal.bytesToBinaryString(compressedStreamData);
 
-const compressedObjStmPdf = buildPdf([
+const compressedObjStmPdf = buildXrefStreamPdf([
   "<< /Type /Catalog /Pages 2 0 R >>",
   "<< /Type /Pages /Kids [11 0 R] /Count 1 >>",
   `<< /Type /ObjStm /N 2 /First ${objStmFirst} /Filter/FlateDecode /Length ${compressedStreamData.length} >>\nstream\n${compressedStreamStr}\nendstream`
-]);
+], {11: [3, 0], 12: [3, 1]});
 
 const compressedResult = analyzePdfDocument(compressedObjStmPdf, "compressed-objstm.pdf");
 assert.equal(compressedResult.pageCount, 1, "FlateDecode ObjStm: should find 1 page");
 
 // A direct object in a later incremental revision must supersede an older ObjStm entry.
-const revisedObjStmPdf = buildPdfWithRevisions([
-  { id: 1, body: "<< /Type /Catalog /Pages 2 0 R >>" },
-  { id: 2, body: "<< /Type /Pages /Kids [11 0 R] /Count 1 >>" },
-  {
-    id: 3,
-    body: `<< /Type /ObjStm /N 2 /First ${objStmFirst} /Length ${objStmStream.length} >>\nstream\n${objStmStream}\nendstream`
-  },
-  { id: 11, body: "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] >>" }
-]);
+const compressedBase = _internal.bytesToBinaryString(compressedObjStmPdf);
+const compressedPrev = Number(compressedBase.match(/startxref\s+(\d+)\s+%%EOF\s*$/)[1]);
+const directRevision = `${compressedBase}11 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] >>\nendobj\n`;
+const revisedObjStmPdf = _internal.binaryStringToBytes(`${directRevision}xref\n11 1\n${String(compressedBase.length).padStart(10, "0")} 00000 n \ntrailer\n<< /Size 14 /Root 1 0 R /Prev ${compressedPrev} >>\nstartxref\n${directRevision.length}\n%%EOF\n`);
 const revisedObjStmDocument = _internal.parseDocument(
   revisedObjStmPdf,
   "revised-objstm.pdf"
@@ -248,7 +244,7 @@ function assertStreamPreserved(pdf, payload) {
   assert.ok(marker);
   const start = marker.index + marker[0].length;
   assert.deepEqual(result.bytes.slice(start, start + payload.length), _internal.binaryStringToBytes(payload));
-  assert.match(text.slice(0, marker.index), new RegExp(`/Length ${payload.length}(?:/Extra true)?\\s*>>$`));
+  assert.match(text.slice(0, marker.index).split("endobj").pop(), new RegExp(`/Length ${payload.length}(?:\\s|/)`));
   assert.equal(analyzePdfDocument(result.bytes, "opaque-merged.pdf").pageCount, 2);
 }
 
@@ -297,7 +293,7 @@ const compactStreamPdf = buildPdf([
   "<< /Type /Catalog /Pages 2 0 R >>",
   "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
   "<< /Type /Page /Parent 2 0 R /Contents 4 0 R >>",
-  `<< /Type/XObject/Other 1/Ref 5 % reference\n0 R /Length ${opaqueStream.length}/Tag/Example >>\nstream\n${opaqueStream}\nendstream`,
+  `<< /Type/XObject/Other 1/CustomRef 5 % reference\n0 R /Length ${opaqueStream.length}/Tag/Example >>\nstream\n${opaqueStream}\nendstream`,
   "42"
 ]);
 assert.equal(analyzePdfDocument(compactStreamPdf).pageCount, 1);
@@ -305,11 +301,11 @@ assert.equal(analyzePdfDocument(compactStreamPdf).pageCount, 1);
 // An ObjStm can itself contain a string with apparent stream delimiters.
 const embeddedPage = "<< /Type /Page /Parent 2 0 R /Note (endstream 1 0 R endobj) >>";
 const embeddedData = "11 0 " + embeddedPage;
-const embeddedPdf = buildPdf([
+const embeddedPdf = buildXrefStreamPdf([
   "<< /Type /Catalog /Pages 2 0 R >>",
   "<< /Type /Pages /Kids [11 0 R] /Count 1 /MediaBox [0 0 200 200] >>",
   `<< /Type /ObjStm /N 1 /First 5 /Length ${embeddedData.length} >>\nstream\n${embeddedData}\nendstream`
-]);
+], {11: [3, 0]});
 assert.equal(analyzePdfDocument(embeddedPdf, "embedded.pdf").pageCount, 1);
 assert.ok(_internal.bytesToBinaryString(mergePdfDocuments([{data: embeddedPdf}]).bytes)
   .includes("(endstream 1 0 R endobj)"));
@@ -325,29 +321,29 @@ for (const prefix of [
   "% /N 999 /First 0 /Filter /ASCII85Decode\n",
   "/Note <2f4e20393939> "
 ]) {
-  const pdf = buildPdf([
+  const pdf = buildXrefStreamPdf([
     "<< /Type /Catalog /Pages 2 0 R >>",
     "<< /Type /Pages /Kids [11 0 R] /Count 1 >>",
     `<< ${prefix}/Type /ObjStm /N 2 /First ${objStmFirst} /Filter /FlateDecode /Length ${compressedStreamData.length} >>\nstream\n${compressedStreamStr}\nendstream`
-  ]);
+  ], {11: [3, 0], 12: [3, 1]});
   assert.equal(analyzePdfDocument(pdf).pageCount, 1, prefix);
   assert.equal(analyzePdfDocument(mergePdfDocuments([{ data: pdf }]).bytes).pageCount, 1);
 }
 
 for (const filter of ["/FlateDecode", "[ % filter\n/FlateDecode ]", "/Flate#44ecode"]) {
-  const pdf = buildPdf([
+  const pdf = buildXrefStreamPdf([
     "<< /Type /Catalog /Pages 2 0 R >>",
     "<< /Type /Pages /Kids [11 0 R] /Count 1 >>",
     `<< /Type/ObjStm/#4e% count\n2/First% offset\n${objStmFirst}/Filter ${filter}/Length ${compressedStreamData.length} >>\nstream\n${compressedStreamStr}\nendstream`
-  ]);
+  ], {11: [3, 0], 12: [3, 1]});
   assert.equal(analyzePdfDocument(pdf).pageCount, 1, filter);
 }
 
-const unsupportedFilterPipeline = buildPdf([
+const unsupportedFilterPipeline = buildXrefStreamPdf([
   "<< /Type /Catalog /Pages 2 0 R >>",
   "<< /Type /Pages /Kids [11 0 R] /Count 1 >>",
   `<< /Type /ObjStm /N 2 /First ${objStmFirst} /Filter [/FlateDecode /ASCII85Decode] /Length ${compressedStreamData.length} >>\nstream\n${compressedStreamStr}\nendstream`
-]);
+], {11: [3, 0], 12: [3, 1]});
 assertThrowsPdfError(() => analyzePdfDocument(unsupportedFilterPipeline), "filter");
 
 console.log("pdf-merger tests passed");

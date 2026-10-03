@@ -193,6 +193,10 @@ button {
   color: var(--ink);
 }
 
+.add-file-icon {
+  margin-right: 4px;
+}
+
 .secondary-button:hover:not(:disabled) {
   border-color: var(--line-strong);
   transform: translateY(-1px);

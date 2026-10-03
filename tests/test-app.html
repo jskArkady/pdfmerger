@@ -25,13 +25,16 @@
         const d = frame.contentDocument;
         const get = (id) => d.getElementById(id);
         const names = () => Array.from(d.querySelectorAll(".file-name"), (node) => node.textContent).join(",");
-        function select(namesToAdd) {
+        function selectFiles(filesToAdd) {
           const transfer = new w.DataTransfer();
-          namesToAdd.forEach((name) => transfer.items.add(new w.File(
-            [PdfFixtures.makeSinglePagePdf(name)], name, { type: "application/pdf" }
-          )));
+          filesToAdd.forEach((file) => transfer.items.add(file));
           get("fileInput").files = transfer.files;
           get("fileInput").dispatchEvent(new w.Event("change"));
+        }
+        function select(namesToAdd) {
+          selectFiles(namesToAdd.map((name) => new w.File(
+            [PdfFixtures.makeSinglePagePdf(name)], name, { type: "application/pdf" }
+          )));
         }
         function holdReads() {
           const pending = [];
@@ -48,7 +51,7 @@
           get("sortSelect").value = value;
           get("sortSelect").dispatchEvent(new w.Event("change"));
         }
-        return { w, d, get, names, select, holdReads, sort };
+        return { w, d, get, names, select, selectFiles, holdReads, sort };
       }
       async function test(name, action) {
         try {
@@ -172,6 +175,141 @@
         assert(text.indexOf("(first.pdf") < text.indexOf("(second.pdf"), "page order changed");
         assert(app.w.PdfMerger.analyzePdfDocument(bytes).pageCount === 2, "merged page count differs");
         assert(!app.get("mergeButton").disabled, "download left UI locked");
+      });
+
+      await test("file size limit rejects before reading", async (app) => {
+        const pending = app.holdReads();
+        Object.defineProperty(app.w.File.prototype, "size", {
+          get() { return app.w.PdfMerger.LIMITS.fileBytes + 1; }
+        });
+        app.select(["oversized.pdf"]);
+        assert(pending.length === 0, "oversized file was read");
+        assert(app.names() === "", "oversized file entered the queue");
+        assert(app.get("mergeButton").disabled, "rejected selection can merge");
+        assert(app.get("status").classList.contains("is-error"), "size error is missing");
+      });
+
+      await test("total size limit includes existing and pending files", async (app) => {
+        const pending = app.holdReads();
+        const limits = app.w.PdfMerger.LIMITS;
+        Object.defineProperty(app.w.File.prototype, "size", {
+          get() { return limits.fileBytes; }
+        });
+        const count = Math.floor(limits.totalBytes / limits.fileBytes);
+        const accepted = Array.from({ length: count }, (_, index) => `part-${index}.pdf`);
+        app.select(accepted);
+        app.select(["overflow.pdf"]);
+        assert(app.names() === accepted.join(","), "total size overflow altered the queue");
+        assert(pending.length === 2, "pending file bytes were not bounded");
+        assert(app.get("status").classList.contains("is-error"), "total size error is missing");
+      });
+
+      await test("file count limit rejects the selection atomically", async (app) => {
+        const pending = app.holdReads();
+        app.select(Array.from({ length: app.w.PdfMerger.LIMITS.files + 1 }, (_, index) => `${index}.pdf`));
+        assert(pending.length === 0, "over-limit selection started reading");
+        assert(app.names() === "", "over-limit selection partially entered the queue");
+        assert(app.get("status").classList.contains("is-error"), "file count error is missing");
+      });
+
+      await test("overlapping selections share two read slots", async (app) => {
+        const pending = app.holdReads();
+        app.select(["a.pdf", "b.pdf", "c.pdf"]);
+        app.select(["d.pdf", "e.pdf"]);
+        assert(pending.length === 2, "overlapping selection exceeded two reads");
+        pending[0].resolve();
+        await tick();
+        assert(pending.length === 3 && pending[2].name === "c.pdf", "read slot did not advance in order");
+        pending[1].reject();
+        await tick();
+        assert(pending.length === 4 && pending[3].name === "d.pdf", "failed read did not release its slot");
+        pending[2].resolve();
+        pending[3].resolve();
+        await tick();
+        assert(pending.length === 5 && pending[4].name === "e.pdf", "remaining read was skipped");
+        pending[4].resolve();
+        await tick();
+        assert(app.get("mergeButton").disabled, "failed read allowed a merge");
+        app.d.querySelectorAll(".remove")[1].click();
+        assert(!app.get("mergeButton").disabled, "completed queue did not become ready");
+      });
+
+      await test("clear and remove skip waiting reads without resetting active slots", async (app) => {
+        const pending = app.holdReads();
+        app.select(["old-a.pdf", "old-b.pdf", "old-waiting.pdf"]);
+        app.get("clearButton").click();
+        app.select(["new-a.pdf", "new-b.pdf", "new-waiting.pdf"]);
+        app.d.querySelectorAll(".remove")[2].click();
+        assert(pending.length === 2, "clear reset active read slots");
+        pending[0].resolve();
+        pending[1].reject();
+        await tick();
+        assert(pending.length === 4, "replacement reads did not start");
+        assert(pending[2].name === "new-a.pdf" && pending[3].name === "new-b.pdf", "removed waiting file was read");
+        pending[2].resolve();
+        pending[3].resolve();
+        await tick();
+        assert(pending.length === 4, "deleted queue item was read later");
+        assert(app.names() === "new-a.pdf,new-b.pdf", "cleared file reappeared");
+        assert(!app.get("mergeButton").disabled, "stale read affected the new queue");
+      });
+
+      await test("security rejection prevents saving", async (app) => {
+        const bytes = PdfFixtures.buildPdf([
+          "<< /Type /Catalog /Pages 2 0 R /OpenAction << /S /JavaScript /JS (test) >> >>",
+          "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+          "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] >>"
+        ]);
+        let saveAttempts = 0;
+        app.w.showSaveFilePicker = async () => { saveAttempts++; throw new Error("unexpected save"); };
+        app.w.URL.createObjectURL = () => { saveAttempts++; return "blob:unexpected"; };
+        app.selectFiles([new app.w.File([bytes], "active-content.pdf", { type: "application/pdf" })]);
+        for (let index = 0; index < 200 && !app.d.querySelector(".file-error"); index++) await tick();
+        assert(app.d.querySelector(".file-error"), "active PDF was accepted");
+        assert(app.get("mergeButton").disabled, "security-rejected PDF can merge");
+        app.get("mergeButton").click();
+        assert(saveAttempts === 0, "security-rejected PDF reached saving");
+      });
+
+      await test("save errors restore controls and report failure", async (app) => {
+        const pending = app.holdReads();
+        app.select(["valid.pdf"]);
+        pending[0].resolve();
+        await tick();
+        app.w.showSaveFilePicker = async () => ({
+          createWritable: async () => ({
+            write: async () => { throw new Error("synthetic disk failure"); },
+            close: async () => {}
+          })
+        });
+        app.get("mergeButton").click();
+        await tick();
+        assert(app.get("status").textContent === "synthetic disk failure", "save failure was hidden");
+        assert(app.get("status").classList.contains("is-error"), "save failure is not marked");
+        assert(!app.get("mergeButton").disabled && !app.get("fileInput").disabled, "save failure left controls locked");
+      });
+
+      await test("CSP blocks page connections and inline scripts", async (app) => {
+        assert(app.d.querySelectorAll("[style]").length === 0, "inline style remains");
+        const violations = [];
+        app.d.addEventListener("securitypolicyviolation", (event) => {
+          violations.push(event.effectiveDirective);
+        });
+        let rejected = false;
+        try {
+          await app.w.fetch("../index.html");
+        } catch (error) {
+          rejected = true;
+        }
+        assert(rejected, "CSP allowed a page connection");
+        for (let index = 0; index < 20 && !violations.includes("connect-src"); index++) await tick();
+        assert(violations.includes("connect-src"), "connection failed without a CSP violation");
+        const script = app.d.createElement("script");
+        script.textContent = "window.inlineSecurityTestExecuted = true;";
+        app.d.body.append(script);
+        assert(!app.w.inlineSecurityTestExecuted, "CSP allowed an inline script");
+        for (let index = 0; index < 20 && !violations.some((directive) => directive.startsWith("script-src")); index++) await tick();
+        assert(violations.some((directive) => directive.startsWith("script-src")), "inline script did not trigger CSP");
       });
 
       document.title = report.failed ? "FAIL: PDF merger UI tests" : "PASS: PDF merger UI tests";

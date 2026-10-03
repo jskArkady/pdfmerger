@@ -19,6 +19,9 @@
   let downloadUrl = "";
   let addedOrder = 0;
   let isMerging = false;
+  let pendingReads = [];
+  let activeReads = 0;
+  const MAX_CONCURRENT_READS = 2;
 
   function formatBytes(bytes) {
     if (bytes < 1024) {
@@ -202,12 +205,17 @@
   function removeItem(id) {
     if (isMerging) return;
     revokeDownload();
-    files = files.filter((item) => item.id !== id);
+    files = files.filter((item) => {
+      if (item.id !== id) return true;
+      item.arrayBuffer = null;
+      return false;
+    });
+    pendingReads = pendingReads.filter((item) => item.id !== id);
     setStatus("");
     render();
   }
 
-  async function addFiles(fileListObject) {
+  function addFiles(fileListObject) {
     if (isMerging) return;
     const selected = Array.from(fileListObject).filter((file) => {
       return file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf");
@@ -215,6 +223,22 @@
 
     if (selected.length === 0) {
       setStatus("PDF 파일만 추가할 수 있습니다.", "warning");
+      return;
+    }
+
+    const limits = PdfMerger.LIMITS;
+    if (files.length + selected.length > limits.files) {
+      setStatus(`파일은 최대 ${limits.files}개까지 추가할 수 있습니다.`, "error");
+      return;
+    }
+    if (selected.some((file) => file.size > limits.fileBytes)) {
+      setStatus(`각 PDF는 ${formatBytes(limits.fileBytes)} 이하여야 합니다.`, "error");
+      return;
+    }
+    const totalBytes = files.reduce((sum, item) => sum + item.file.size, 0)
+      + selected.reduce((sum, file) => sum + file.size, 0);
+    if (totalBytes > limits.totalBytes) {
+      setStatus(`PDF의 전체 크기는 ${formatBytes(limits.totalBytes)} 이하여야 합니다.`, "error");
       return;
     }
 
@@ -232,28 +256,42 @@
     setStatus("파일을 확인하는 중입니다.");
     render();
 
-    await Promise.all(
-      nextItems.map(async (item) => {
-        try {
-          const arrayBuffer = await item.file.arrayBuffer();
-          // Removed files must not reappear or publish a stale result.
-          if (!files.includes(item)) return;
-          item.arrayBuffer = arrayBuffer;
-          const info = PdfMerger.analyzePdfDocument(
-            new Uint8Array(item.arrayBuffer),
-            item.file.name
-          );
-          item.pageCount = info.pageCount;
-          item.status = "ready";
-        } catch (error) {
-          if (!files.includes(item)) return;
-          item.status = "error";
-          item.error = error.message || "이 PDF는 병합할 수 없습니다.";
-        } finally {
-          if (files.includes(item)) updateReadStatus();
-        }
-      })
-    );
+    pendingReads.push(...nextItems);
+    startPendingReads();
+  }
+
+  function startPendingReads() {
+    while (activeReads < MAX_CONCURRENT_READS && pendingReads.length > 0) {
+      const item = pendingReads.shift();
+      if (!files.includes(item)) continue;
+      activeReads += 1;
+      readFile(item).finally(() => {
+        activeReads -= 1;
+        startPendingReads();
+      });
+    }
+  }
+
+  async function readFile(item) {
+    try {
+      const arrayBuffer = await item.file.arrayBuffer();
+      // Removed files must not reappear or publish a stale result.
+      if (!files.includes(item)) return;
+      const info = PdfMerger.analyzePdfDocument(
+        new Uint8Array(arrayBuffer),
+        item.file.name
+      );
+      item.arrayBuffer = arrayBuffer;
+      item.pageCount = info.pageCount;
+      item.status = "ready";
+    } catch (error) {
+      item.arrayBuffer = null;
+      if (!files.includes(item)) return;
+      item.status = "error";
+      item.error = error.message || "이 PDF는 병합할 수 없습니다.";
+    } finally {
+      if (files.includes(item)) updateReadStatus();
+    }
   }
 
   function updateReadStatus() {
@@ -342,7 +380,9 @@
   clearButton.addEventListener("click", () => {
     if (isMerging) return;
     revokeDownload();
+    files.forEach((item) => { item.arrayBuffer = null; });
     files = [];
+    pendingReads = [];
     sortSelect.value = "manual";
     setStatus("");
     render();
